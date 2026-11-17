@@ -464,12 +464,414 @@ def git_upload_pack(repo, body, params):
     return result + (sideband(pack) + b"0000" if "side-band-64k" in caps else pack)
 
 
-def handle_graphql(payload):
-    raise NotImplementedError("GraphQL is reserved for a later session")
+class GraphQLParser:
+    """Small recursive parser; selections retain aliases, arguments and fragments."""
+
+    def __init__(self, source, variables):
+        self.tokens = []
+        pattern = re.compile(r'\s+|#[^\n]*|,|\.\.\.|"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?|[A-Za-z_][A-Za-z_0-9]*|[!$():=@\[\]{}]')
+        pos = 0
+        while pos < len(source):
+            match = pattern.match(source, pos)
+            if not match:
+                raise ValueError("Invalid query at position " + str(pos))
+            token = match.group()
+            if not token.isspace() and not token.startswith('#') and token != ',':
+                self.tokens.append(token)
+            pos = match.end()
+        self.pos = 0
+        self.variables = dict(variables)
+        self.fragments = {}
+
+    def peek(self):
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+
+    def take(self, expected=None):
+        token = self.peek()
+        if token is None or (expected is not None and token != expected):
+            raise ValueError("Expected " + str(expected or "token"))
+        self.pos += 1
+        return token
+
+    def value(self):
+        token = self.take()
+        if token == '$':
+            return self.variables.get(self.take())
+        if token == '{':
+            result = {}
+            while self.peek() != '}':
+                key = self.take()
+                self.take(':')
+                result[key] = self.value()
+            self.take('}')
+            return result
+        if token == '[':
+            result = []
+            while self.peek() != ']':
+                result.append(self.value())
+            self.take(']')
+            return result
+        if token.startswith('"') or token in ('true', 'false', 'null') or re.match(r'-?\d', token):
+            return json.loads(token)
+        return token
+
+    def arguments(self):
+        result = {}
+        if self.peek() == '(':
+            self.take('(')
+            while self.peek() != ')':
+                key = self.take()
+                self.take(':')
+                result[key] = self.value()
+            self.take(')')
+        return result
+
+    def selection(self):
+        self.take('{')
+        fields = []
+        while self.peek() != '}':
+            name = self.take()
+            alias, condition = name, None
+            if name == '...':
+                name = self.take()
+                if name == 'on':
+                    condition = self.take()
+                    name = '...'
+                else:
+                    name = '...' + name
+            elif self.peek() == ':':
+                self.take(':')
+                name = self.take()
+            args = self.arguments()
+            include = True
+            while self.peek() == '@':
+                self.take('@')
+                directive = self.take()
+                test = self.arguments().get('if')
+                if (directive == 'skip' and test) or (directive == 'include' and not test):
+                    include = False
+            children = self.selection() if self.peek() == '{' else []
+            if include:
+                fields.append((alias, name, args, children, condition))
+        self.take('}')
+        return fields
+
+    def document(self):
+        operations = []
+        while self.peek() is not None:
+            if self.peek() == 'fragment':
+                self.take()
+                name = self.take()
+                self.take('on')
+                condition = self.take()
+                self.fragments[name] = (condition, self.selection())
+                continue
+            kind, name = 'query', None
+            if self.peek() != '{':
+                kind = self.take()
+                if kind not in ('query', 'mutation'):
+                    raise ValueError('Unknown operation ' + kind)
+                if self.peek() not in ('(', '{'):
+                    name = self.take()
+                if self.peek() == '(':
+                    self.take('(')
+                    while self.peek() != ')':
+                        self.take('$')
+                        key = self.take()
+                        self.take(':')
+                        while self.peek() not in ('=', '$', ')'):
+                            self.take()
+                        if self.peek() == '=':
+                            self.take('=')
+                            default = self.value()
+                            self.variables.setdefault(key, default)
+                    self.take(')')
+            operations.append((name, kind, self.selection()))
+        return operations
 
 
-def handle_mcp(payload):
-    raise NotImplementedError("MCP is reserved for a later session")
+GRAPHQL_FIELDS = {
+    'Query': 'repository node viewer __type __schema',
+    'Mutation': 'createPullRequest mergePullRequest',
+    'Repository': 'id databaseId name nameWithOwner owner defaultBranchRef viewerPermission hasIssuesEnabled issue issues pullRequests pullRequest',
+    'Issue': 'id number title state body createdAt updatedAt url author repository',
+    'PullRequest': 'id number title body headRefName baseRefName mergeable state merged files createdAt updatedAt url author repository',
+    'User': 'id login', 'Ref': 'name target', 'Commit': 'id oid',
+    'IssueConnection': 'nodes edges totalCount pageInfo',
+    'PullRequestConnection': 'nodes edges totalCount pageInfo',
+    'PullRequestChangedFileConnection': 'nodes edges totalCount pageInfo',
+    'PullRequestChangedFile': 'path additions deletions changeType',
+    'Edge': 'node cursor', 'PageInfo': 'hasNextPage hasPreviousPage startCursor endCursor',
+    'CreatePullRequestPayload': 'pullRequest clientMutationId',
+    'MergePullRequestPayload': 'pullRequest clientMutationId',
+}
+
+
+def gql_object(typename, **values):
+    return dict(values, __typename=typename)
+
+
+def gql_id(kind, number):
+    return base64.b64encode(f'{kind}:{number}'.encode()).decode()
+
+
+class GraphQL:
+    def __init__(self, handler, parser):
+        self.handler, self.parser = handler, parser
+
+    def repository(self, repo):
+        return gql_object('Repository', _repo=repo)
+
+    def issue(self, repo, issue):
+        return gql_object('PullRequest' if 'head' in issue else 'Issue', _repo=repo, _issue=issue)
+
+    def node(self, identifier):
+        for repo in self.handler.store.repos.values():
+            if identifier == gql_id('Repository', repo.metadata['id']):
+                return self.repository(repo)
+            for issue in repo.issues.values():
+                kind = 'PullRequest' if 'head' in issue else 'Issue'
+                if identifier == gql_id(kind, issue['id']):
+                    return self.issue(repo, issue)
+        return None
+
+    def connection(self, kind, values, args):
+        total = len(values)
+        start = int(args.get('after') or 0)
+        first = int(args.get('first', total))
+        if first < 0:
+            raise ValueError('first must be nonnegative')
+        nodes = values[start:start + first]
+        cursors = [str(start + i + 1) for i in range(len(nodes))]
+        return gql_object(kind, nodes=nodes, totalCount=total,
+                          edges=[gql_object('Edge', node=n, cursor=c) for n, c in zip(nodes, cursors)],
+                          pageInfo=gql_object('PageInfo', hasNextPage=start + len(nodes) < total,
+                                              hasPreviousPage=start > 0, startCursor=cursors[0] if cursors else None,
+                                              endCursor=cursors[-1] if cursors else None))
+
+    def type_info(self, name):
+        enums = {'SearchType': ['ISSUE', 'REPOSITORY', 'USER'], 'IssueState': ['OPEN', 'CLOSED'],
+                 'PullRequestState': ['OPEN', 'CLOSED', 'MERGED']}
+        if name not in GRAPHQL_FIELDS and name not in enums and name not in ('String', 'ID', 'Int', 'Boolean'):
+            return None
+        return gql_object('__Type', name=name, kind='ENUM' if name in enums else 'OBJECT' if name in GRAPHQL_FIELDS else 'SCALAR',
+                          description=None, ofType=None, interfaces=[], possibleTypes=None, inputFields=None,
+                          fields=[gql_object('__Field', name=f, description=None, args=[], isDeprecated=False,
+                                             deprecationReason=None, type=gql_object('__Type', kind='SCALAR', name='String', ofType=None))
+                                  for f in GRAPHQL_FIELDS.get(name, '').split()] if name in GRAPHQL_FIELDS else None,
+                          enumValues=[gql_object('__EnumValue', name=v, description=None, isDeprecated=False,
+                                                 deprecationReason=None) for v in enums[name]] if name in enums else None)
+
+    def resolve(self, obj, name, args):
+        kind = obj['__typename']
+        if name == '__typename':
+            return kind
+        if kind in GRAPHQL_FIELDS and name not in GRAPHQL_FIELDS[kind].split():
+            raise ValueError(f'Unknown field "{name}" on type "{kind}"')
+        if kind == 'Query':
+            if name == '__type':
+                return self.type_info(args.get('name'))
+            if name == '__schema':
+                return gql_object('__Schema', queryType=self.type_info('Query'), mutationType=self.type_info('Mutation'),
+                                  subscriptionType=None, directives=[], types=[self.type_info(n) for n in
+                                  list(GRAPHQL_FIELDS) + ['SearchType', 'IssueState', 'PullRequestState', 'String', 'ID', 'Int', 'Boolean']])
+            if name == 'viewer':
+                return gql_object('User', login=LOGIN, id=gql_id('User', 1))
+            if name == 'node':
+                return self.node(args.get('id'))
+            repo = self.handler.store.repos.get(str(args.get('name', '')).lower()) if args.get('owner') == LOGIN else None
+            return self.repository(repo) if repo else None
+        if kind == 'Mutation':
+            data = args.get('input', {})
+            if name == 'createPullRequest':
+                node = self.node(data.get('repositoryId'))
+                if not node or node['__typename'] != 'Repository':
+                    raise ValueError('Unknown repositoryId')
+                repo = node['_repo']
+                issue = self.handler.create_pull(repo, dict(title=data.get('title'), head=data.get('headRefName'),
+                                                            base=data.get('baseRefName'), body=data.get('body')))
+                payload_kind = 'CreatePullRequestPayload'
+            else:
+                node = self.node(data.get('pullRequestId'))
+                if not node or node['__typename'] != 'PullRequest':
+                    raise ValueError('Unknown pullRequestId')
+                repo, issue = node['_repo'], node['_issue']
+                self.handler.merge_pull(repo, issue)
+                payload_kind = 'MergePullRequestPayload'
+            return gql_object(payload_kind, pullRequest=self.issue(repo, issue), clientMutationId=data.get('clientMutationId'))
+        if kind == 'Repository':
+            repo = obj['_repo']
+            meta = repo.metadata
+            values = dict(id=gql_id(kind, meta['id']), databaseId=meta['id'], name=meta['name'],
+                          nameWithOwner=meta['full_name'], owner=gql_object('User', login=LOGIN, id=gql_id('User', 1)),
+                          viewerPermission='ADMIN', hasIssuesEnabled=True,
+                          defaultBranchRef=gql_object('Ref', name=meta['default_branch'],
+                              target=gql_object('Commit', oid=repo.refs.get(meta['default_branch']),
+                                                id=gql_id('Commit', repo.refs.get(meta['default_branch'])))) if repo.refs else None)
+            if name in values:
+                return values[name]
+            pulls = name in ('pullRequest', 'pullRequests')
+            if name in ('issue', 'pullRequest'):
+                issue = repo.issues.get(str(args.get('number')))
+                return self.issue(repo, issue) if issue and ('head' in issue) == pulls else None
+            issues = [i for i in repo.issues.values() if ('head' in i) == pulls]
+            if args.get('states'):
+                issues = [i for i in issues if ('MERGED' if i.get('merged') else i['state'].upper()) in args['states']]
+            order = args.get('orderBy') or {}
+            issues.sort(key=lambda i: (i['created_at'], i['number']), reverse=order.get('direction', 'DESC') == 'DESC')
+            return self.connection('PullRequestConnection' if pulls else 'IssueConnection',
+                                   [self.issue(repo, i) for i in issues], args)
+        if kind in ('Issue', 'PullRequest'):
+            repo, issue = obj['_repo'], obj['_issue']
+            values = dict(issue, id=gql_id(kind, issue['id']), state='MERGED' if issue.get('merged') else issue['state'].upper(),
+                          createdAt=issue['created_at'], updatedAt=issue['updated_at'],
+                          author=gql_object('User', login=LOGIN, id=gql_id('User', 1)), repository=self.repository(repo))
+            if kind == 'PullRequest':
+                values.update(headRefName=issue['head']['ref'], baseRefName=issue['base']['ref'], mergeable='MERGEABLE',
+                              files=self.connection('PullRequestChangedFileConnection', [gql_object('PullRequestChangedFile',
+                                  path=p, additions=0, deletions=0, changeType='MODIFIED') for p in self.handler.pull_files(repo, issue)], args))
+            return values.get(name)
+        if name not in obj:
+            raise ValueError(f'Unknown field "{name}" on type "{kind}"')
+        return obj[name]
+
+    def select(self, obj, fields, stack=()):
+        if obj is None:
+            return None
+        if isinstance(obj, list):
+            return [self.select(item, fields, stack) for item in obj]
+        result = {}
+        for alias, name, args, children, condition in fields:
+            if name.startswith('...'):
+                if name != '...':
+                    fragment = name[3:]
+                    if fragment in stack:
+                        raise ValueError('Cyclic fragment ' + fragment)
+                    if fragment not in self.parser.fragments:
+                        raise ValueError('Unknown fragment ' + fragment)
+                    condition, children = self.parser.fragments[fragment]
+                    nested_stack = stack + (fragment,)
+                else:
+                    nested_stack = stack
+                if condition in (None, obj['__typename'], 'Node'):
+                    result.update(self.select(obj, children, nested_stack))
+                continue
+            value = self.resolve(obj, name, args)
+            result[alias] = self.select(value, children, stack) if children else value
+        return result
+
+
+def handle_graphql(handler, payload):
+    if isinstance(payload, list):
+        return [handle_graphql(handler, item) for item in payload]
+    try:
+        if not isinstance(payload, dict) or not isinstance(payload.get('query'), str):
+            raise ValueError('query must be a string')
+        parser = GraphQLParser(payload['query'], payload.get('variables') or {})
+        operations = parser.document()
+        if payload.get('operationName'):
+            operations = [op for op in operations if op[0] == payload['operationName']]
+        if not operations:
+            raise ValueError('No matching operation')
+        engine = GraphQL(handler, parser)
+        results = []
+        for _, kind, fields in operations:
+            try:
+                results.append({'data': engine.select(gql_object('Mutation' if kind == 'mutation' else 'Query'), fields)})
+            except (ValueError, TypeError, KeyError, APIError) as error:
+                results.append({'data': None, 'errors': [{'message': getattr(error, 'message', str(error))}]})
+        return results[0] if len(results) == 1 else results
+    except (ValueError, TypeError, KeyError, RecursionError) as error:
+        return {'errors': [{'message': str(error)}]}
+
+
+def rpc_error(identifier, code, message):
+    return {'jsonrpc': '2.0', 'id': identifier, 'error': {'code': code, 'message': message}}
+
+
+MCP_TOOLS = [
+    {'name': name, 'description': description,
+     'inputSchema': {'type': 'object', 'properties': {key: {'type': 'integer' if key == 'pull_number' else 'string'}
+                                                    for key in properties.split()}, 'required': required.split()}}
+    for name, description, properties, required in [
+        ('create_repo', 'Create a repository for the authenticated user.', 'name', 'name'),
+        ('get_repo', 'Read repository metadata.', 'owner repo', 'owner repo'),
+        ('create_issue', 'Create an issue in a repository.', 'owner repo title body', 'owner repo title'),
+        ('list_issues', 'List repository issues filtered by state.', 'owner repo state', 'owner repo'),
+        ('create_pull_request', 'Create a pull request between existing branches.', 'owner repo title head base', 'owner repo title head base'),
+        ('merge_pull_request', 'Merge a pull request into its base branch.', 'owner repo pull_number', 'owner repo pull_number'),
+    ]
+]
+
+
+def handle_mcp(handler, payload):
+    if isinstance(payload, list):
+        return [handle_mcp(handler, item) for item in payload] if payload else rpc_error(None, -32600, 'Empty batch')
+    if not isinstance(payload, dict):
+        return rpc_error(None, -32600, 'Invalid request')
+    identifier = payload.get('id')
+    method, params = payload.get('method'), payload.get('params') or {}
+    if not isinstance(params, dict):
+        return rpc_error(identifier, -32602, 'params must be an object')
+    if method == 'initialize':
+        result = {'protocolVersion': params.get('protocolVersion') or payload.get('protocolVersion') or '2026-07-28',
+                  'capabilities': {'tools': {}}, 'serverInfo': {'name': 'forge-mcp', 'version': '1.0.0'}}
+    elif method == 'notifications/initialized':
+        result = {}
+    elif method == 'server/discover':
+        result = {'supportedVersions': ['2026-07-28']}
+    elif method == 'tools/list':
+        result = {'tools': MCP_TOOLS}
+    elif method == 'tools/call':
+        normalize = lambda text: re.sub(r'[_-]', '', text).lower()
+        requested = params.get('name', '')
+        tool = next((t for t in MCP_TOOLS if isinstance(requested, str) and normalize(requested).endswith(normalize(t['name']))), None)
+        if tool is None:
+            return rpc_error(identifier, -32601, 'Unknown tool ' + str(requested))
+        arguments = params.get('arguments', {})
+        if not isinstance(arguments, dict):
+            return rpc_error(identifier, -32602, 'arguments must be an object')
+        incoming = {normalize(k): v for k, v in arguments.items()}
+        args = {k: incoming[normalize(k)] for k in tool['inputSchema']['properties'] if normalize(k) in incoming}
+        if isinstance(incoming.get('fullname'), str) and '/' in incoming['fullname']:
+            owner, repo = incoming['fullname'].split('/', 1)
+            args.setdefault('owner', owner)
+            args.setdefault('repo', repo)
+        missing = [k for k in tool['inputSchema']['required'] if k not in args or args[k] in (None, '')]
+        if missing:
+            return rpc_error(identifier, -32602, 'Missing required argument: ' + ', '.join(missing))
+        for key, value in args.items():
+            expected = int if key == 'pull_number' else str
+            if not isinstance(value, expected) or isinstance(value, bool):
+                return rpc_error(identifier, -32602, 'Invalid argument: ' + key)
+        name = tool['name']
+        route = ['api', 'v3', 'repos', args.get('owner', ''), args.get('repo', '')]
+        query, verb = {}, 'POST'
+        if name == 'create_repo':
+            route = ['api', 'v3', 'user', 'repos']
+        elif name == 'get_repo':
+            verb = 'GET'
+        elif name in ('create_issue', 'list_issues'):
+            route.append('issues')
+            if name == 'list_issues':
+                verb, query = 'GET', {'state': [args.get('state', 'open')]}
+        elif name == 'create_pull_request':
+            route.append('pulls')
+        else:
+            route.extend(['pulls', str(args['pull_number']), 'merge'])
+            verb = 'PUT'
+        previous = handler.command
+        try:
+            handler.command = verb
+            _, value, _ = handler.dispatch(route, query, args)
+            result = {'content': [{'type': 'text', 'text': json.dumps(value, separators=(',', ':'))}]}
+        except APIError as error:
+            return rpc_error(identifier, -32602, error.message)
+        finally:
+            handler.command = previous
+    else:
+        return rpc_error(identifier, -32601, 'Unknown method ' + str(method))
+    return {'jsonrpc': '2.0', 'id': identifier, 'result': result}
 
 
 class APIError(Exception):
@@ -641,7 +1043,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.base_url + "/api/v3"
 
     def respond(self, status, payload=None, headers=None):
-        body = b"" if status == 204 else json.dumps(
+        body = b"" if status in (202, 204) else json.dumps(
             payload, ensure_ascii=True, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -664,7 +1066,7 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(self.headers.get("Authorization", "").encode(),
                                    ("Bearer " + self.server.token).encode())
 
-    def read_payload(self):
+    def read_payload(self, allow_batch=False):
         if self.headers.get("Transfer-Encoding"):
             self.close_connection = True
             raise APIError(400, "Unsupported Transfer-Encoding")
@@ -686,7 +1088,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(raw)
         except (ValueError, UnicodeError):
             raise APIError(400, "Malformed JSON body")
-        if not isinstance(payload, dict):
+        if not allow_batch and not isinstance(payload, dict):
             raise APIError(400, "JSON body must be an object")
         return payload
 
@@ -778,6 +1180,21 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) >= 3 and parts[1].endswith(".git"):
                 self.git_request(parts, query)
                 return
+            if self.command == 'POST' and parts in (['api', 'graphql'], ['mcp']):
+                graphql = parts == ['api', 'graphql']
+                try:
+                    payload = self.read_payload(allow_batch=True)
+                except APIError as error:
+                    self.respond(200 if graphql else 400,
+                                 {'errors': [{'message': error.message}]} if graphql else
+                                 rpc_error(None, -32700, error.message))
+                    return
+                with self.store.lock:
+                    result = handle_graphql(self, payload) if graphql else handle_mcp(self, payload)
+                    self.store.save()
+                    notification = not graphql and isinstance(payload, dict) and payload.get('method') == 'notifications/initialized'
+                    self.respond(202 if notification else 200, result)
+                return
             payload = self.read_payload()
             with self.store.lock:
                 status, result, headers = self.dispatch(parts, query, payload)
@@ -861,6 +1278,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def repository_route(self, repo, route, query, payload):
         method = self.command
+        if route == ['pulls']:
+            if method == 'POST':
+                return 201, self.create_pull(repo, payload), {}
+            if method == 'GET':
+                state = query.get('state', ['open'])[0]
+                return self.paginate([i for i in repo.issues.values() if 'head' in i and
+                                      (state == 'all' or i['state'] == state)], query)
+        if len(route) >= 2 and route[0] == 'pulls':
+            issue = repo.issues.get(route[1])
+            if not issue or 'head' not in issue:
+                raise APIError(404, 'Pull request not found')
+            if len(route) == 2 and method == 'GET':
+                return 200, issue, {}
+            if route[2:] == ['merge'] and method == 'PUT':
+                self.merge_pull(repo, issue)
+                return 200, {'merged': True, 'sha': issue['merge_commit_sha'], 'message': 'Pull request successfully merged'}, {}
+            if route[2:] == ['files'] and method == 'GET':
+                return self.paginate([{'filename': p, 'status': 'modified'} for p in self.pull_files(repo, issue)], query)
         if not route:
             if method == "GET":
                 return 200, self.repo_json(repo), {}
@@ -915,10 +1350,19 @@ class Handler(BaseHTTPRequestHandler):
                 issues = [i for i in repo.issues.values() if state == "all" or i["state"] == state]
                 issues.sort(key=lambda i: i["number"], reverse=query.get("direction", ["desc"])[0] != "asc")
                 return self.paginate([self.issue_json(repo, i) for i in issues], query)
-        if len(route) == 2 and route[0] == "issues" and method == "GET":
+        if len(route) == 2 and route[0] == "issues" and method in ("GET", "PATCH"):
             issue = repo.issues.get(route[1])
             if issue is None:
                 raise APIError(404, "Not Found")
+            if method == 'PATCH':
+                if 'state' in payload and payload['state'] not in ('open', 'closed'):
+                    raise APIError(422, 'Invalid state')
+                for key in ('title', 'body'):
+                    if key in payload and not isinstance(payload[key], str):
+                        raise APIError(422, 'Invalid ' + key)
+                issue.update({k: payload[k] for k in ('title', 'body', 'state') if k in payload})
+                issue['updated_at'] = self.store.date()
+                issue['closed_at'] = issue['updated_at'] if issue['state'] == 'closed' else None
             return 200, self.issue_json(repo, issue), {}
         if route == ["commits"] and method == "GET":
             if not repo.refs:
@@ -933,6 +1377,94 @@ class Handler(BaseHTTPRequestHandler):
                 sha = commit["parent"]
             return self.paginate(commits, query)
         raise APIError(404, "Not Found")
+
+    def create_pull(self, repo, payload):
+        title = required_text(payload, 'title')
+        head = required_text(payload, 'head')
+        base = required_text(payload, 'base')
+        if ':' in head:
+            owner, head = head.split(':', 1)
+            if owner != LOGIN:
+                raise APIError(422, 'Unknown head repository')
+        if head == base or head not in repo.refs or base not in repo.refs:
+            raise APIError(422, 'Head and base must be distinct existing branches')
+        number, date = len(repo.issues) + 1, self.store.date()
+        issue = {'id': self.store.identifier(), 'number': number, 'title': title, 'body': payload.get('body'),
+                 'state': 'open', 'merged': False, 'mergeable': True, 'merge_commit_sha': None,
+                 'head': {'ref': head, 'sha': repo.refs[head]}, 'base': {'ref': base, 'sha': repo.refs[base]},
+                 'created_at': date, 'updated_at': date, 'closed_at': None, 'merged_at': None,
+                 'user': {'login': LOGIN}, 'labels': [], 'comments': 0,
+                 'url': self.base + '/repos/' + repo.metadata['full_name'] + '/pulls/' + str(number)}
+        issue['node_id'] = gql_id('PullRequest', issue['id'])
+        issue['pull_request'] = {'url': issue['url']}
+        repo.issues[str(number)] = issue
+        return issue
+
+    def pull_merge_snapshot(self, repo, issue):
+        head = repo.resolve(issue['head']['ref'])
+        base = repo.resolve(issue['base']['ref'])
+
+        def ancestors(start):
+            result, queue = set(), [start]
+            while queue:
+                sha = queue.pop()
+                if sha not in result:
+                    result.add(sha)
+                    _, parents = commit_headers(split_object(repo.objects[sha])[1])
+                    queue.extend(parents)
+            return result
+
+        head_ancestors = ancestors(head)
+        queue, seen, common = [base], set(), None
+        while queue:
+            sha = queue.pop(0)
+            if sha in head_ancestors:
+                common = sha
+                break
+            if sha not in seen:
+                seen.add(sha)
+                _, parents = commit_headers(split_object(repo.objects[sha])[1])
+                queue.extend(parents)
+        previous = repo.commits[common]['files'] if common else {}
+        source, target = repo.commits[head]['files'], repo.commits[base]['files']
+        files, changed = dict(target), []
+        for path in sorted(previous.keys() | source.keys()):
+            if source.get(path) == previous.get(path):
+                continue
+            if target.get(path) not in (previous.get(path), source.get(path)):
+                raise APIError(409, 'Merge conflict in ' + path)
+            if source.get(path) != target.get(path):
+                changed.append(path)
+            if path in source:
+                files[path] = source[path]
+            else:
+                files.pop(path, None)
+        return files, changed, head, base
+
+    def pull_files(self, repo, issue):
+        source = repo.commits[repo.resolve(issue['head']['ref'])]['files']
+        target = repo.commits[issue['base']['sha']]['files']
+        return sorted(p for p in source.keys() | target.keys() if source.get(p) != target.get(p))
+
+    def merge_pull(self, repo, issue):
+        if issue['merged']:
+            return
+        if issue['state'] != 'open':
+            raise APIError(409, 'Pull request is closed')
+        files, changed, head, base = self.pull_merge_snapshot(repo, issue)
+        date = self.store.date()
+        branch = issue['base']['ref']
+        sha = repo.commit(files, 'Merge pull request #' + str(issue['number']) + ': ' + issue['title'],
+                          branch, date, changed)
+        # Preserve both parents so subsequent Git fetches see a real merge commit.
+        content = split_object(repo.objects[sha])[1]
+        content = content.replace(('parent ' + base + '\n').encode(),
+                                  ('parent ' + base + '\nparent ' + head + '\n').encode(), 1)
+        merged_sha = repo.object('commit', content)
+        repo.commits[merged_sha] = repo.commits[sha]
+        repo.refs[branch] = merged_sha
+        issue.update(merged=True, state='closed', merged_at=date, closed_at=date, updated_at=date,
+                     merge_commit_sha=merged_sha)
 
     def issue_json(self, repo, issue):
         result = dict(issue)
