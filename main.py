@@ -12,11 +12,13 @@ import hmac
 import json
 import os
 import re
+import struct
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -25,12 +27,441 @@ LOGIN = "octo-user"
 EPOCH = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
 
 
+ZERO = "0" * 40
+OBJECT_TYPES = {1: "commit", 2: "tree", 3: "blob", 4: "tag"}
+MAX_GIT_BODY = 256 * 1024 * 1024
+MAX_OBJECT = 64 * 1024 * 1024
+
+
+def pktline(data):
+    if isinstance(data, str):
+        data = data.encode()
+    if len(data) > 65515:
+        raise ValueError("pkt-line too large")
+    return f"{len(data) + 4:04x}".encode() + data
+
+
+def read_pkt(data, offset):
+    if offset + 4 > len(data):
+        raise ValueError("Truncated pkt-line")
+    size = int(data[offset:offset + 4], 16)
+    if size in (0, 1, 2):
+        return size, offset + 4
+    if size < 4 or size > 65520 or offset + size > len(data):
+        raise ValueError("Invalid pkt-line length")
+    return data[offset + 4:offset + size], offset + size
+
+
+def packet_lines(data):
+    offset = 0
+    while offset < len(data):
+        line, offset = read_pkt(data, offset)
+        if isinstance(line, bytes):
+            yield line.rstrip(b"\n")
+
+
+def sideband(data):
+    return b"".join(pktline(b"\x01" + data[i:i + 65514])
+                    for i in range(0, len(data), 65514))
+
+
+def split_object(raw):
+    header, content = raw.split(b"\0", 1)
+    return header.split(b" ", 1)[0].decode(), content
+
+
+def object_raw(kind, content):
+    return kind.encode() + b" " + str(len(content)).encode() + b"\0" + content
+
+
+def apply_delta(base, delta):
+    pos = 0
+
+    def integer():
+        nonlocal pos
+        result = shift = 0
+        while True:
+            byte = delta[pos]
+            pos += 1
+            result |= (byte & 127) << shift
+            if not byte & 128:
+                return result
+            shift += 7
+            if shift > 63:
+                raise ValueError("Invalid delta integer")
+
+    if integer() != len(base):
+        raise ValueError("Delta base size mismatch")
+    size = integer()
+    if size > MAX_OBJECT:
+        raise ValueError("Delta object too large")
+    result = bytearray()
+    while pos < len(delta):
+        opcode = delta[pos]
+        pos += 1
+        if opcode & 128:
+            start = length = 0
+            for i in range(4):
+                if opcode & (1 << i):
+                    start |= delta[pos] << (8 * i)
+                    pos += 1
+            for i in range(3):
+                if opcode & (16 << i):
+                    length |= delta[pos] << (8 * i)
+                    pos += 1
+            length = length or 65536
+            if start + length > len(base) or len(result) + length > size:
+                raise ValueError("Invalid delta copy")
+            result.extend(memoryview(base)[start:start + length])
+        elif opcode:
+            if pos + opcode > len(delta) or len(result) + opcode > size:
+                raise ValueError("Invalid delta insert")
+            result.extend(delta[pos:pos + opcode])
+            pos += opcode
+        else:
+            raise ValueError("Invalid delta opcode")
+    if len(result) != size:
+        raise ValueError("Delta result size mismatch")
+    return bytes(result)
+
+
+def parse_pack(data, existing):
+    """Validate into a quarantine dict; resolve forward REF and thin-pack deltas."""
+    if len(data) < 32 or data[:4] != b"PACK":
+        raise ValueError("Invalid PACK header")
+    version, count = struct.unpack_from(">II", data, 4)
+    if version != 2 or count > len(data) // 3:
+        raise ValueError("Invalid PACK version or count")
+    if hashlib.sha1(memoryview(data)[:-20]).digest() != data[-20:]:
+        raise ValueError("PACK checksum mismatch")
+    end = len(data) - 20
+    pos = 12
+    offsets, objects, pending = {}, {}, []
+    expanded = inflated = 0
+
+    def store(offset, kind, content):
+        nonlocal expanded
+        expanded += len(content)
+        if expanded > MAX_GIT_BODY:
+            raise ValueError("Unpacked data too large")
+        raw = object_raw(kind, content)
+        sha = hashlib.sha1(raw).hexdigest()
+        objects[sha] = raw
+        offsets[offset] = sha
+
+    for _ in range(count):
+        offset = pos
+        byte = data[pos]
+        pos += 1
+        kind, size, shift = (byte >> 4) & 7, byte & 15, 4
+        while byte & 128:
+            byte = data[pos]
+            pos += 1
+            size |= (byte & 127) << shift
+            shift += 7
+            if shift > 63:
+                raise ValueError("Invalid object size")
+        if size > MAX_OBJECT:
+            raise ValueError("Object too large")
+        inflated += size
+        if inflated > MAX_GIT_BODY:
+            raise ValueError("Inflated pack too large")
+        base = None
+        if kind == 6:
+            byte = data[pos]
+            pos += 1
+            distance = byte & 127
+            while byte & 128:
+                byte = data[pos]
+                pos += 1
+                distance = ((distance + 1) << 7) | (byte & 127)
+                if distance > offset:
+                    raise ValueError("Invalid delta offset")
+            base = offset - distance
+            if distance == 0 or base < 12:
+                raise ValueError("Invalid delta offset")
+        elif kind == 7:
+            base = data[pos:pos + 20].hex()
+            pos += 20
+        elif kind not in OBJECT_TYPES:
+            raise ValueError("Unsupported object type")
+        inflater = zlib.decompressobj()
+        content = bytearray()
+        while not inflater.eof and pos < end:
+            chunk = memoryview(data)[pos:min(end, pos + 65536)]
+            out = inflater.decompress(chunk, size + 1 - len(content))
+            content.extend(out)
+            consumed = len(chunk) - len(inflater.unused_data) - len(inflater.unconsumed_tail)
+            pos += consumed
+            if len(content) > size or (not consumed and not out):
+                raise ValueError("Invalid compressed object size")
+        if not inflater.eof or len(content) != size:
+            raise ValueError("Truncated compressed object")
+        if kind in (6, 7):
+            pending.append((offset, base, bytes(content)))
+        else:
+            store(offset, OBJECT_TYPES[kind], bytes(content))
+    if pos != end:
+        raise ValueError("Trailing PACK data")
+    while pending:
+        remaining = []
+        for offset, base, delta in pending:
+            sha = offsets.get(base) if isinstance(base, int) else base
+            raw = objects.get(sha) or existing.get(sha)
+            if raw is None:
+                remaining.append((offset, base, delta))
+                continue
+            kind, content = split_object(raw)
+            store(offset, kind, apply_delta(content, delta))
+        if len(remaining) == len(pending):
+            raise ValueError("Missing delta base")
+        pending = remaining
+    return objects
+
+
+def write_pack(repo, shas):
+    pack = bytearray(b"PACK" + struct.pack(">II", 2, len(shas)))
+    types = {name: number for number, name in OBJECT_TYPES.items()}
+    for sha in sorted(shas):
+        kind, content = split_object(repo.objects[sha])
+        size = len(content)
+        byte = (types[kind] << 4) | (size & 15)
+        size >>= 4
+        pack.append(byte | (128 if size else 0))
+        while size:
+            byte = size & 127
+            size >>= 7
+            pack.append(byte | (128 if size else 0))
+        pack.extend(zlib.compress(content))
+    pack.extend(hashlib.sha1(pack).digest())
+    return bytes(pack)
+
+
+def tree_entries(content):
+    pos = 0
+    while pos < len(content):
+        stop = content.index(b"\0", pos)
+        mode, name = content[pos:stop].split(b" ", 1)
+        if stop + 21 > len(content):
+            raise ValueError("Truncated tree entry")
+        yield mode, name.decode("utf-8", "surrogateescape"), content[stop + 1:stop + 21].hex()
+        pos = stop + 21
+
+
+def commit_headers(content):
+    headers = content.split(b"\n\n", 1)[0].splitlines()
+    tree = next(line[5:].decode() for line in headers if line.startswith(b"tree "))
+    parents = [line[7:].decode() for line in headers if line.startswith(b"parent ")]
+    return tree, parents
+
+
+def reachable(repo, starts, depth=None, shallow=()):
+    seen, boundaries, levels = set(), set(), {}
+    queue = [(sha, 1) for sha in starts]
+    while queue:
+        sha, level = queue.pop()
+        if sha in levels and levels[sha] <= level:
+            continue
+        levels[sha] = level
+        raw = repo.objects.get(sha)
+        if raw is None:
+            raise ValueError("Missing object " + sha)
+        seen.add(sha)
+        kind, content = split_object(raw)
+        if kind == "commit":
+            tree, parents = commit_headers(content)
+            queue.append((tree, level))
+            if (depth is not None and level >= depth) or sha in shallow:
+                if parents:
+                    boundaries.add(sha)
+            else:
+                queue.extend((parent, level + 1) for parent in parents)
+        elif kind == "tree":
+            queue.extend((child, level) for mode, _, child in tree_entries(content)
+                         if mode != b"160000")
+        elif kind == "tag":
+            queue.append((content.splitlines()[0][7:].decode(), level))
+    return seen, boundaries
+
+
+def index_commits(repo, objects):
+    """Expose pushed commits through the same snapshot index used by REST."""
+    indexed = {}
+    for sha, raw in objects.items():
+        kind, content = split_object(raw)
+        if kind != "commit":
+            continue
+        tree, parents = commit_headers(content)
+        files, stack = {}, [(tree, "")]
+        while stack:
+            tree_sha, prefix = stack.pop()
+            tree_kind, entries = split_object(repo.objects[tree_sha])
+            if tree_kind != "tree":
+                raise ValueError("Commit references a non-tree")
+            for mode, name, child in tree_entries(entries):
+                if mode in (b"40000", b"040000"):
+                    stack.append((child, prefix + name + "/"))
+                elif mode != b"160000":
+                    files[prefix + name] = child
+        date = "2026-01-01T00:00:00Z"
+        for line in content.split(b"\n\n", 1)[0].splitlines():
+            if line.startswith(b"committer "):
+                seconds = int(line.rsplit(b" ", 2)[1])
+                date = datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        indexed[sha] = {"tree": tree, "parent": parents[0] if parents else None,
+                        "message": content.split(b"\n\n", 1)[-1].decode("utf-8", "replace").rstrip("\n"),
+                        "date": date, "files": files, "changed": []}
+    for commit in indexed.values():
+        parent = indexed.get(commit["parent"]) or repo.commits.get(commit["parent"], {})
+        previous = parent.get("files", {})
+        commit["changed"] = sorted(path for path in previous.keys() | commit["files"].keys()
+                                   if previous.get(path) != commit["files"].get(path))
+    return indexed
+
+
+def full_refs(repo):
+    return {name if name.startswith("refs/") else "refs/heads/" + name: sha
+            for name, sha in repo.refs.items()}
+
+
+def git_advertisement(repo, service, v2=False):
+    intro = pktline(f"# service={service}\n") + b"0000"
+    if v2 and service == "git-upload-pack":
+        return intro + b"".join(pktline(line + "\n") for line in
+                                ("version 2", "ls-refs=unborn", "fetch=shallow",
+                                 "object-format=sha1", "agent=forge/1.0")) + b"0000"
+    refs = full_refs(repo)
+    head = "refs/heads/" + repo.metadata["default_branch"]
+    if service == "git-upload-pack":
+        caps = "multi_ack multi_ack_detailed thin-pack side-band-64k ofs-delta shallow agent=forge/1.0"
+        if head in refs:
+            caps += " symref=HEAD:" + head
+    else:
+        caps = "report-status delete-refs side-band-64k ofs-delta agent=forge/1.0"
+    lines = ([("HEAD", refs[head])] if head in refs else []) + sorted(refs.items())
+    if not lines:
+        lines = [("capabilities^{}", ZERO)]
+    return intro + b"".join(pktline(f"{sha} {ref}" + ("\0" + caps if i == 0 else "") + "\n")
+                             for i, (ref, sha) in enumerate(lines)) + b"0000"
+
+
 def git_receive_pack(repo, body):
-    raise NotImplementedError("Git receive-pack is reserved for a later session")
+    commands, caps, pos = [], set(), 0
+    while True:
+        line, pos = read_pkt(body, pos)
+        if line == 0:
+            break
+        if not isinstance(line, bytes):
+            raise ValueError("Invalid receive command")
+        command, separator, capabilities = line.rstrip(b"\n").partition(b"\0")
+        if separator:
+            caps.update(capabilities.decode().split())
+        old, new, ref = command.decode().split()
+        if not re.fullmatch(r"[0-9a-f]{40}", old) or not re.fullmatch(r"[0-9a-f]{40}", new):
+            raise ValueError("Invalid object ID")
+        if not ref.startswith("refs/") or any(c in ref for c in ("..", " ", "~", "^", ":", "?", "*", "[", "\\")):
+            raise ValueError("Invalid ref name")
+        commands.append((old, new, ref))
+    pack = body[pos:]
+    if pack and not pack.startswith(b"PACK") and "side-band-64k" in caps:
+        chunks = []
+        offset = 0
+        while offset < len(pack):
+            line, offset = read_pkt(pack, offset)
+            if line == 0:
+                continue
+            if not isinstance(line, bytes):
+                raise ValueError("Invalid incoming pack packet")
+            if line[:1] != b"\x01":
+                raise ValueError("Invalid incoming pack band")
+            chunks.append(line[1:])
+        pack = b"".join(chunks)
+    objects = parse_pack(pack, repo.objects) if pack else {}
+    # Keep validation and indexing transactional, including malformed trees/commits.
+    view = Repository(repo.metadata)
+    view.objects = repo.objects | objects
+    view.commits = repo.commits
+    indexed = index_commits(view, objects)
+    for _, new, _ in commands:
+        if new != ZERO:
+            reachable(view, [new])
+    repo.objects.update(objects)
+    repo.commits.update(indexed)
+    result = pktline("unpack ok\n")
+    for old, new, ref in commands:
+        key = ref.removeprefix("refs/heads/")
+        current = repo.refs.get(key, ZERO)
+        if old != current and old != ZERO:
+            result += pktline(f"ng {ref} non-fast-forward\n")
+        elif new != ZERO and ref.startswith("refs/heads/") and new not in repo.commits:
+            result += pktline(f"ng {ref} not a commit\n")
+        else:
+            if new == ZERO:
+                repo.refs.pop(key, None)
+            else:
+                repo.refs[key] = new
+            result += pktline(f"ok {ref}\n")
+    result += b"0000"
+    return sideband(result) + b"0000" if "side-band-64k" in caps else result
 
 
 def git_upload_pack(repo, body, params):
-    raise NotImplementedError("Git upload-pack is reserved for a later session")
+    lines = [line.decode() for line in packet_lines(body)]
+    command = next((line[8:] for line in lines if line.startswith("command=")), None)
+    if command == "ls-refs":
+        refs = full_refs(repo)
+        head = "refs/heads/" + repo.metadata["default_branch"]
+        if head in refs:
+            refs = {"HEAD": refs[head], **refs}
+        prefixes = [line[11:] for line in lines if line.startswith("ref-prefix ")]
+        result = bytearray()
+        for ref, sha in refs.items():
+            if prefixes and not any(ref.startswith(prefix) for prefix in prefixes):
+                continue
+            attributes = " symref-target:" + head if ref == "HEAD" and "symrefs" in lines else ""
+            if "peel" in lines:
+                peeled = sha
+                while split_object(repo.objects[peeled])[0] == "tag":
+                    peeled = split_object(repo.objects[peeled])[1].splitlines()[0][7:].decode()
+                if peeled != sha:
+                    attributes += " peeled:" + peeled
+            result.extend(pktline(f"{sha} {ref}{attributes}\n"))
+        return bytes(result) + b"0000"
+    if command not in (None, "fetch"):
+        raise ValueError("Unsupported v2 command")
+    wants = [line.split()[1] for line in lines if line.startswith("want ")]
+    haves = [line.split()[1] for line in lines if line.startswith("have ")]
+    shallow = {line.split()[1] for line in lines if line.startswith("shallow ")}
+    depth = next((int(line.split()[1]) for line in lines if line.startswith("deepen ")), None)
+    if depth is not None and depth < 1:
+        raise ValueError("Invalid depth")
+    done = "done" in lines
+    common = [sha for sha in haves if sha in repo.objects]
+    # Protocol v2 uses ACK <oid>/NAK and delimiter packets between sections.
+    if command and not done:
+        return pktline("acknowledgments\n") + (b"".join(pktline(f"ACK {sha}\n") for sha in common)
+                                                 or pktline("NAK\n")) + b"0000"
+    wanted, boundaries = reachable(repo, wants, depth)
+    have_objects, _ = reachable(repo, common, shallow=shallow)
+    pack = write_pack(repo, wanted - have_objects)
+    shallow_lines = b""
+    if depth is not None:
+        shallow_lines = b"".join(pktline(f"shallow {sha}\n") for sha in sorted(boundaries - shallow))
+        shallow_lines += b"".join(pktline(f"unshallow {sha}\n") for sha in sorted((shallow & wanted) - boundaries))
+    if command:
+        result = (pktline("shallow-info\n") + shallow_lines + b"0001") if shallow_lines else b""
+        # v2 packfile data is always sideband framed, independent of capabilities.
+        return result + pktline("packfile\n") + sideband(pack) + b"0000"
+    caps = set(" ".join(line for line in lines if line.startswith("want ")).split())
+    result = (shallow_lines + b"0000") if depth is not None else b""
+    if depth is not None and not done and not haves:
+        return result
+    if not done and "multi_ack_detailed" in caps:
+        result += b"".join(pktline(f"ACK {sha} common\n") for sha in common)
+    result += pktline("NAK\n")
+    if not done and haves:
+        return result
+    return result + (sideband(pack) + b"0000" if "side-band-64k" in caps else pack)
 
 
 def handle_graphql(payload):
@@ -259,16 +690,95 @@ class Handler(BaseHTTPRequestHandler):
             raise APIError(400, "JSON body must be an object")
         return payload
 
+    def read_git_body(self):
+        """Git switches to chunked HTTP for pushes larger than http.postBuffer."""
+        lengths = self.headers.get_all("Content-Length", [])
+        transfer = self.headers.get("Transfer-Encoding", "").lower()
+        if len(lengths) > 1 or (transfer and lengths):
+            raise ValueError("Ambiguous request length")
+        result = bytearray()
+        if transfer:
+            if transfer != "chunked":
+                raise ValueError("Unsupported Transfer-Encoding")
+            while True:
+                line = self.rfile.readline(8192)
+                if not line.endswith(b"\r\n"):
+                    raise ValueError("Invalid chunk header")
+                size = int(line.split(b";", 1)[0], 16)
+                if size < 0 or size + len(result) > MAX_GIT_BODY:
+                    raise ValueError("Git request too large")
+                if not size:
+                    trailer_size = 0
+                    while True:
+                        trailer = self.rfile.readline(8192)
+                        trailer_size += len(trailer)
+                        if not trailer or trailer_size > 8192:
+                            raise ValueError("Invalid chunk trailers")
+                        if trailer == b"\r\n":
+                            return bytes(result)
+                chunk = self.rfile.read(size)
+                if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                    raise ValueError("Truncated chunk")
+                result.extend(chunk)
+        length = int(lengths[0]) if lengths else 0
+        if not 0 <= length <= MAX_GIT_BODY:
+            raise ValueError("Git request too large")
+        data = self.rfile.read(length)
+        if len(data) != length:
+            raise ValueError("Truncated request")
+        return data
+
+    def git_request(self, parts, query):
+        try:
+            body = self.read_git_body()
+            with self.store.lock:
+                repo = self.store.repos.get(parts[1][:-4].lower()) if parts[0] == LOGIN else None
+                if repo is None:
+                    raise APIError(404, "Not Found")
+                with repo.lock:
+                    if self.command == "GET" and parts[2:] == ["info", "refs"]:
+                        service = query.get("service", [""])[0]
+                        if service not in ("git-upload-pack", "git-receive-pack"):
+                            raise APIError(400, "Unsupported Git service")
+                        result = git_advertisement(repo, service,
+                                                   "version=2" in self.headers.get("Git-Protocol", "").split(":"))
+                        content_type = f"application/x-{service}-advertisement"
+                    elif self.command == "POST" and parts[2:] in (["git-receive-pack"], ["git-upload-pack"]):
+                        service = parts[2]
+                        if service == "git-receive-pack":
+                            result = git_receive_pack(repo, body)
+                            date = self.store.date()
+                            repo.metadata.update(updated_at=date, pushed_at=date)
+                        else:
+                            result = git_upload_pack(repo, body, query)
+                        content_type = f"application/x-{service}-result"
+                    else:
+                        raise APIError(404, "Not Found")
+                if self.command == "POST" and service == "git-receive-pack":
+                    self.store.save()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(result)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(result)
+        except (ValueError, IndexError, KeyError, StopIteration, OverflowError, zlib.error, struct.error) as error:
+            self.close_connection = True
+            raise APIError(400, "Invalid Git request: " + str(error))
+
     def request(self):
         if not self.authorized():
             self.close_connection = True
             self.respond(401, {"message": "Requires authentication"}, {"Connection": "close"})
             return
         try:
-            payload = self.read_payload()
             parsed = urllib.parse.urlsplit(self.path)
             parts = [urllib.parse.unquote(p) for p in parsed.path.rstrip("/").split("/")[1:]]
             query = urllib.parse.parse_qs(parsed.query)
+            if len(parts) >= 3 and parts[1].endswith(".git"):
+                self.git_request(parts, query)
+                return
+            payload = self.read_payload()
             with self.store.lock:
                 status, result, headers = self.dispatch(parts, query, payload)
                 if self.command in ("POST", "PUT", "PATCH", "DELETE"):
