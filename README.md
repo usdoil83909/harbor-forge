@@ -1,5 +1,9 @@
 # Harbor Forge — a GitHub-compatible git forge in one pure-stdlib Python file
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/usdoil83909/harbor-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/usdoil83909/harbor-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 [![Built for make.fun](https://img.shields.io/badge/built%20for-make.fun-8B5CF6)](https://make.fun)
 [![bounty](https://img.shields.io/badge/bounty-github--core--clone--01-22c55e)](https://make.fun/c/github-core-clone-01)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -72,3 +76,8 @@ The implementation is one file with logical modules:
 Push validation uses a quarantine mapping and remembers validated immutable object closures. Each repository caches one depth-1 pack for requests without haves or shallow boundaries; the cache key includes all refs and wanted IDs, so ref changes invalidate it lazily. Ordinary issue reads serialize a snapshot after releasing the repository lock.
 
 See [BENCHMARK.md](BENCHMARK.md) for measurements and reproduction instructions. The project is licensed under [MIT](LICENSE).
+
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=vvzx249a&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
