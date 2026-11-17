@@ -48,3 +48,20 @@ Validation: `python3 test_protocols.py` passed all 17 protocol check groups,
 the lifecycle/persistence checks, and merge conflict checks.
 `python3 -m unittest -v test_performance` passed both targeted cache and malformed
 push regression tests. `git diff --check` passed.
+
+## How to reproduce
+
+From the repository root, with Python and Git available, run:
+
+```sh
+python3 benchmark.py
+```
+
+This runs three rounds by default and prints each workload's elapsed seconds
+followed by a `MEDIANS` JSON object. Each round starts its own loopback server with
+persistence disabled, so no running forge, environment registration, or shop token
+is needed. It measures 200 sequential pushes, 50 concurrent depth-1 clones, 2,000
+issue reads, and 200 issue creations, and removes its repository-local scratch
+directories afterward. Use `--rounds 1` for a shorter run; use
+`--rounds 1 --profile` separately for diagnostic profiling, whose serialized
+instrumentation changes the timing conditions.
