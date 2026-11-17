@@ -1,10 +1,14 @@
 """HTTP and real-Git regression checks; all scratch files stay in this repo."""
 import json
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
+import sys
+import socket
 import urllib.error
 import urllib.request
 
@@ -20,7 +24,7 @@ class QuietHandler(main.Handler):
 
 
 def run():
-    server = main.ThreadingHTTPServer(('127.0.0.1', 0), QuietHandler)
+    server = main.ForgeServer(('127.0.0.1', 0), QuietHandler)
     server.store = main.Store('')
     server.token = 'integration-token'
     server.base_url = 'http://127.0.0.1:' + str(server.server_port)
@@ -32,7 +36,7 @@ def run():
         passed.append(label)
         print('PASS ' + label)
 
-    def http(path, payload=None, method=None, status=200, auth=True, raw=None):
+    def http(path, payload=None, method=None, status=200, auth=True, raw=None, response_headers=None):
         headers = {'Content-Type': 'application/json'}
         if auth:
             headers['Authorization'] = 'Bearer ' + server.token
@@ -43,6 +47,10 @@ def run():
         except urllib.error.HTTPError as error:
             response = error
         with response:
+            assert response.headers.get('X-GitHub-Request-Id')
+            assert response.headers.get_content_type() == 'application/json'
+            if response_headers is not None:
+                response_headers.update(response.headers)
             body = response.read()
             assert response.status == status, (path, response.status, body)
         return json.loads(body) if body else None, body
@@ -126,6 +134,31 @@ def run():
         rpc('tools/list', auth=False, status=401)
         check('MCP unknown tool, required arguments, malformed JSON and authentication errors')
 
+        http(repo_path, {'description': 'updated'}, method='PATCH')
+        assert http(repo_path)[0]['description'] == 'updated'
+        http(repo_path + '/issues', {'title': 'bad label', 'labels': ['bug']}, status=422)
+        http(repo_path + '/labels', {'name': 'bug', 'color': 'ff0000'}, status=201)
+        assert http(repo_path + '/issues', {'title': 'labeled', 'labels': ['bug']}, status=201)[0]['labels'][0]['name'] == 'bug'
+        http('/api/v3/repos/wrong/protocol-test', status=404)
+        http('/unknown', status=404)
+        http('/unknown', method='TRACE', status=404)
+        for raw in (b'{', b'[]', b'null', b'\xff'):
+            http('/api/v3/user/repos', raw=raw, status=400)
+        disposable = '/api/v3/repos/octo-user/disposable'
+        http('/api/v3/user/repos', {'name': 'disposable'}, status=201)
+        headers = {}
+        assert len(http('/api/v3/user/repos?per_page=1&page=1', response_headers=headers)[0]) == 1
+        assert 'page=2' in headers['Link'] and 'rel="next"' in headers['Link']
+        assert len(http('/api/v3/user/repos?per_page=1&page=2')[0]) == 1
+        file = disposable + '/contents/a.txt'
+        created = http(file, {'message': 'create', 'content': 'YQ=='}, method='PUT', status=201)[0]
+        http(file, {'message': 'stale', 'content': 'Yg==', 'sha': '0' * 40}, method='PUT', status=409)
+        http(file, {'message': 'delete', 'sha': created['content']['sha']}, method='DELETE')
+        http(file, status=404)
+        http(disposable, method='DELETE', status=204)
+        http(disposable, status=404)
+        check('REST description, deletion, stale sha, labels, pagination, malformed JSON, owner mismatch and JSON headers')
+
         with tempfile.TemporaryDirectory(prefix='.protocol-test-', dir=ROOT) as directory:
             work = Path(directory)
             env = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
@@ -174,13 +207,15 @@ def run():
                 assert saved['merge_commit_sha'] == merged['sha']
                 git('fetch', 'origin')
                 assert git('rev-parse', 'origin/main') == merged['sha']
-                assert git('show', '-s', '--format=%P', 'origin/main') == base
-                assert git('rev-list', '--count', base + '..origin/main') == '1'
+                assert git('show', '-s', '--format=%P', 'origin/main') == base + ' ' + head
+                assert git('rev-list', '--first-parent', '--count', base + '..origin/main') == '1'
+                assert git('show', '-s', '--format=%B', 'origin/main') == 'Merge pull request #' + str(pr['number'])
+                assert saved['merged_commit'] == merged['sha']
                 assert git('show', 'origin/main:' + branch + '.txt') == 'feature two'
                 assert git('show', 'origin/main:' + transport.lower() + '-base.txt') == 'independent base change'
                 assert git('rev-parse', 'origin/' + branch) == head
                 git('merge', '--ff-only', 'origin/main')
-                check(transport + ' merge: pushed head, REST IDs/state, single-parent squash on current base, fetched Git contents')
+                check(transport + ' merge: pushed head, REST IDs/state, two parents, merged tree and default message')
             git('checkout', '-b', 'conflict')
             commit('shared.txt', 'head conflict\n')
             git('push', 'origin', 'conflict')
@@ -202,6 +237,47 @@ def run():
             response, _ = rpc('tools/call', {'name': 'merge_pull_request', 'arguments': dict(args, pull_number=99999)})
             assert response['error']['message'] == missing['message']
             check('Unknown pull: REST 404 and MCP matching error')
+            git('clone', '--depth', '1', repo['clone_url'], 'shallow')
+            assert git('-C', 'shallow', 'rev-list', '--count', 'HEAD') == '1'
+            check('Real git clone --depth 1')
+
+            git('checkout', '-b', 'modes')
+            commit('executable', 'executable content\n')
+            git('update-index', '--chmod=+x', 'executable')
+            git('commit', '-m', 'executable mode')
+            git('push', 'origin', 'modes')
+            pr = pull('modes', False)
+            merged = http(repo_path + '/pulls/' + str(pr['number']) + '/merge',
+                          {'commit_message': 'custom merge'}, method='PUT')[0]
+            git('fetch', 'origin')
+            assert git('show', '-s', '--format=%B', merged['sha']) == 'custom merge'
+            assert git('ls-tree', merged['sha'], 'executable').startswith('100755')
+            assert http(repo_path + '/pulls?state=all')[0]
+            http(repo_path + '/pulls', {'title': 'missing', 'head': 'missing', 'base': 'main'}, status=422)
+            check('Custom merge message, executable mode, pull listing and missing head validation')
+
+            barrier = threading.Barrier(24)
+            def concurrent(i):
+                barrier.wait(timeout=10)
+                if i < 20:
+                    return http(repo_path + '/issues', {'title': 'parallel-' + str(i)}, status=201)[0]['number']
+                git('push', 'origin', 'HEAD:refs/heads/parallel-' + str(i))
+                return None
+            with ThreadPoolExecutor(max_workers=24) as pool:
+                results = list(pool.map(concurrent, range(24)))
+            assert len(set(results[:20])) == 20
+            git('fetch', 'origin')
+            for i in range(20, 24):
+                assert git('rev-parse', 'origin/parallel-' + str(i)) == git('rev-parse', 'HEAD')
+            check('20 parallel REST mutations plus four real Git pushes without deadlocks')
+            for garbage in (b'garbage\r\n\r\n', b'GET / HTTP/1.1\r\nBad\r\n\r\n'):
+                with socket.create_connection(server.server_address, timeout=5) as connection:
+                    connection.sendall(garbage)
+                    connection.shutdown(socket.SHUT_WR)
+                    assert connection.recv(8192)
+            http('/octo-user/protocol-test.git/git-receive-pack', raw=b'garbage', status=400)
+            http('/api/v3/user')
+            check('Garbage HTTP/Git input leaves server serving')
         print(f'ALL {len(passed)} CHECK GROUPS PASSED')
     finally:
         server.shutdown()
@@ -209,5 +285,102 @@ def run():
         thread.join()
 
 
+def handshake():
+    registered = threading.Event()
+    polls = []
+    ports = []
+
+    class Environment(main.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            assert self.path == '/register'
+            ports.append(json.loads(self.rfile.read(int(self.headers['Content-Length'])))['port'])
+            self.send_response(200)
+            self.end_headers()
+            registered.set()
+
+        def do_GET(self):
+            assert self.path == '/done'
+            polls.append(time.monotonic())
+            body = json.dumps({'done': len(polls) >= 2}).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    environment = main.ForgeServer(('127.0.0.1', 0), Environment)
+    thread = threading.Thread(target=environment.serve_forever, daemon=True)
+    thread.start()
+    with tempfile.TemporaryDirectory(prefix='.handshake-', dir=ROOT) as directory:
+        process = subprocess.Popen([sys.executable, str(ROOT / 'main.py')], cwd=ROOT,
+                                   env=dict(os.environ, MAKEFUN_ENV_URL='http://127.0.0.1:' + str(environment.server_port),
+                                            MAKEFUN_STATE_DIR=directory, MAKEFUN_SHOP_TOKEN='handshake-token'),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            assert registered.wait(10)
+            url = 'http://127.0.0.1:' + str(ports[0]) + '/api/v3/user/repos'
+            def create(i):
+                request = urllib.request.Request(url, data=json.dumps({'name': 'persist-' + str(i)}).encode(),
+                                                 headers={'Authorization': 'Bearer handshake-token', 'Content-Type': 'application/json'})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    assert response.status == 201 and response.headers.get('X-GitHub-Request-Id')
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                list(pool.map(create, range(20)))
+            stdout, stderr = process.communicate(timeout=15)
+            assert process.returncode == 0, (stdout, stderr)
+            assert b'Traceback' not in stderr
+            assert len(polls) == 2 and 4.5 <= polls[1] - polls[0] < 8
+            assert len(main.Store(directory).repos) == 20
+            print('PASS port-0 register/done handshake, five-second repoll, concurrent serving/persistence and exit 0')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+            environment.shutdown()
+            environment.server_close()
+            thread.join()
+
+
+def merge_edges():
+    handler = object.__new__(main.Handler)
+    for label, base_changes, head_changes, conflict in [
+        ('identical edits', {'a': 'same'}, {'a': 'same'}, False),
+        ('head deletion', {}, {'a': None}, False),
+        ('base deletion', {'a': None}, {}, False),
+        ('delete/modify', {'a': None}, {'a': 'edited'}, True),
+        ('add/add', {'new': 'base'}, {'new': 'head'}, True),
+        ('file/directory', {'new': 'file'}, {'new/child': 'child'}, True),
+    ]:
+        repo = main.Repository({})
+        original = {'a': repo.object('blob', b'original')}
+        date = '2026-01-01T00:00:00Z'
+        ancestor = repo.commit(original, 'initial', 'main', date, ['a'])
+        repo.refs['head'] = ancestor
+        for branch, changes in [('main', base_changes), ('head', head_changes)]:
+            files = dict(original)
+            for path, value in changes.items():
+                if value is None:
+                    files.pop(path, None)
+                else:
+                    files[path] = repo.object('blob', value.encode())
+            repo.commit(files, branch, branch, date, list(changes))
+        issue = {'head': {'ref': 'head'}, 'base': {'ref': 'main'}}
+        try:
+            entries, _, _, _ = handler.pull_merge_snapshot(repo, issue)
+        except main.APIError as error:
+            assert conflict and error.status == 405 and error.message == 'Pull Request is not mergeable', label
+        else:
+            assert not conflict, label
+            if 'deletion' in label:
+                assert 'a' not in entries, label
+            if label == 'identical edits':
+                assert repo.blob(entries['a'][1]) == b'same'
+    print('PASS merge identical edits, deletions, delete/modify, add/add and file/directory conflicts')
+
+
 if __name__ == '__main__':
     run()
+    handshake()
+    merge_edges()

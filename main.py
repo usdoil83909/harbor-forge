@@ -6,6 +6,8 @@ an empty string to disable persistence. Stored objects include their Git headers
 
 import base64
 import binascii
+import copy
+from contextlib import ExitStack
 import datetime
 import hashlib
 import hmac
@@ -14,6 +16,7 @@ import os
 import re
 import struct
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,6 +34,11 @@ ZERO = "0" * 40
 OBJECT_TYPES = {1: "commit", 2: "tree", 3: "blob", 4: "tag"}
 MAX_GIT_BODY = 256 * 1024 * 1024
 MAX_OBJECT = 64 * 1024 * 1024
+
+
+class ForgeServer(ThreadingHTTPServer):
+    request_queue_size = 128
+    daemon_threads = True
 
 
 def pktline(data):
@@ -391,7 +399,7 @@ def git_receive_pack(repo, body):
     for old, new, ref in commands:
         key = ref.removeprefix("refs/heads/")
         current = repo.refs.get(key, ZERO)
-        if old != current and old != ZERO:
+        if old != current:
             result += pktline(f"ng {ref} non-fast-forward\n")
         elif new != ZERO and ref.startswith("refs/heads/") and new not in repo.commits:
             result += pktline(f"ng {ref} not a commit\n")
@@ -727,7 +735,8 @@ class GraphQL:
                           createdAt=issue['created_at'], updatedAt=issue['updated_at'],
                           author=gql_object('User', login=LOGIN, id=gql_id('User', 1)), repository=self.repository(repo))
             if kind == 'PullRequest':
-                values.update(headRefName=issue['head']['ref'], baseRefName=issue['base']['ref'], mergeable='MERGEABLE',
+                values.update(headRefName=issue['head']['ref'], baseRefName=issue['base']['ref'],
+                              mergeable='MERGEABLE' if self.handler.pull_json(repo, issue)['mergeable'] else 'CONFLICTING',
                               files=self.connection('PullRequestChangedFileConnection', [gql_object('PullRequestChangedFile',
                                   path=p, additions=0, deletions=0, changeType='MODIFIED') for p in self.handler.pull_files(repo, issue)], args))
             return values.get(name)
@@ -884,7 +893,7 @@ class Repository:
     """Git object database, branch refs, REST metadata, and a per-repo lock."""
 
     def __init__(self, metadata):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.metadata = metadata
         self.objects = {}
         self.refs = {}
@@ -914,14 +923,25 @@ class Repository:
             entries = []
             for name, value in node.items():
                 directory = isinstance(value, dict)
-                sha = build(value) if directory else value
-                mode = b"40000" if directory else b"100644"
-                encoded = name.encode("utf-8")
+                sha = build(value) if directory else value[1] if isinstance(value, tuple) else value
+                mode = b"40000" if directory else value[0] if isinstance(value, tuple) else b"100644"
+                encoded = name.encode("utf-8", "surrogateescape")
                 entries.append((encoded + (b"/" if directory else b""),
                                 mode + b" " + encoded + b"\0" + bytes.fromhex(sha)))
             return self.object("tree", b"".join(v for _, v in sorted(entries)))
 
         return build(root)
+
+    def entries(self, commit):
+        result, stack = {}, [(self.commits[commit]['tree'], '')]
+        while stack:
+            sha, prefix = stack.pop()
+            for mode, name, child in tree_entries(split_object(self.objects[sha])[1]):
+                if mode in (b'40000', b'040000'):
+                    stack.append((child, prefix + name + '/'))
+                else:
+                    result[prefix + name] = (mode, child)
+        return result
 
     def resolve(self, ref):
         sha = self.refs.get(ref, ref)
@@ -936,14 +956,15 @@ class Repository:
             raise APIError(404, "Branch not found")
         return dict(self.commits[self.refs[branch]]["files"])
 
-    def commit(self, files, message, branch, date, changed):
-        tree = self.tree(files)
+    def commit(self, files, message, branch, date, changed, parents=None, tree=None):
+        tree = tree or self.tree(files)
         parent = self.refs.get(branch)
+        parents = parents if parents is not None else ([parent] if parent else [])
         seconds = int(datetime.datetime.fromisoformat(date.replace("Z", "+00:00")).timestamp())
         identity = f"{LOGIN} <{LOGIN}@users.noreply.local> {seconds} +0000"
         content = f"tree {tree}\n"
-        if parent:
-            content += f"parent {parent}\n"
+        for ancestor in parents:
+            content += f"parent {ancestor}\n"
         content += f"author {identity}\ncommitter {identity}\n\n{message}\n"
         sha = self.object("commit", content.encode())
         self.commits[sha] = {"tree": tree, "parent": parent, "message": message,
@@ -969,14 +990,16 @@ class Repository:
 
 
 class Store:
-    """Lock ordering is always store lock then repository lock.
+    """Registry/snapshot locking is store then repo; counters have a separate lock.
 
-    The store lock also serializes deterministic counters and atomic persistence.
-    All request dispatch and JSON serialization happen while it is held.
+    Ordinary repository requests release the registry lock before doing Git work.
+    Persistence runs after request locks are released.
     """
 
     def __init__(self, state_dir):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.counter_lock = threading.Lock()
+        self.save_lock = threading.Lock()
         self.repos = {}
         self.counter = 0
         self.next_id = 1
@@ -988,21 +1011,30 @@ class Store:
             self.repos = {name: Repository.load(repo) for name, repo in data["repos"].items()}
 
     def date(self):
-        date = EPOCH + datetime.timedelta(seconds=self.counter)
-        self.counter += 1
+        with self.counter_lock:
+            date = EPOCH + datetime.timedelta(seconds=self.counter)
+            self.counter += 1
         return date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def identifier(self):
-        value = self.next_id
-        self.next_id += 1
+        with self.counter_lock:
+            value = self.next_id
+            self.next_id += 1
         return value
 
     def save(self):
         if not self.path:
             return
+        with self.save_lock:
+            self._save()
+
+    def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"counter": self.counter, "next_id": self.next_id,
-                "repos": {name: repo.dump() for name, repo in self.repos.items()}}
+        with self.lock, ExitStack() as locks:
+            for repo in self.repos.values():
+                locks.enter_context(repo.lock)
+            data = copy.deepcopy({"counter": self.counter, "next_id": self.next_id,
+                                  "repos": {name: repo.dump() for name, repo in self.repos.items()}})
         temporary = self.path.with_suffix(".tmp")
         with temporary.open("w") as stream:
             json.dump(data, stream, sort_keys=True, separators=(",", ":"))
@@ -1020,6 +1052,16 @@ def required_text(payload, key):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (OSError, ValueError):
+            self.close_connection = True
 
     def send_error(self, code, message=None, explain=None):
         # Keep parser errors and unsupported HTTP verbs in the JSON API contract.
@@ -1083,7 +1125,13 @@ class Handler(BaseHTTPRequestHandler):
             raise APIError(400, "Invalid Content-Length")
         if length == 0:
             return {}
+        if length > MAX_OBJECT:
+            self.close_connection = True
+            raise APIError(413, "Request body too large")
         raw = self.rfile.read(length)
+        if len(raw) != length:
+            self.close_connection = True
+            raise APIError(400, "Truncated request body")
         try:
             payload = json.loads(raw)
         except (ValueError, UnicodeError):
@@ -1137,27 +1185,27 @@ class Handler(BaseHTTPRequestHandler):
                 repo = self.store.repos.get(parts[1][:-4].lower()) if parts[0] == LOGIN else None
                 if repo is None:
                     raise APIError(404, "Not Found")
-                with repo.lock:
-                    if self.command == "GET" and parts[2:] == ["info", "refs"]:
-                        service = query.get("service", [""])[0]
-                        if service not in ("git-upload-pack", "git-receive-pack"):
-                            raise APIError(400, "Unsupported Git service")
-                        result = git_advertisement(repo, service,
-                                                   "version=2" in self.headers.get("Git-Protocol", "").split(":"))
-                        content_type = f"application/x-{service}-advertisement"
-                    elif self.command == "POST" and parts[2:] in (["git-receive-pack"], ["git-upload-pack"]):
-                        service = parts[2]
-                        if service == "git-receive-pack":
-                            result = git_receive_pack(repo, body)
-                            date = self.store.date()
-                            repo.metadata.update(updated_at=date, pushed_at=date)
-                        else:
-                            result = git_upload_pack(repo, body, query)
-                        content_type = f"application/x-{service}-result"
+            with repo.lock:
+                if self.command == "GET" and parts[2:] == ["info", "refs"]:
+                    service = query.get("service", [""])[0]
+                    if service not in ("git-upload-pack", "git-receive-pack"):
+                        raise APIError(400, "Unsupported Git service")
+                    result = git_advertisement(repo, service,
+                                               "version=2" in self.headers.get("Git-Protocol", "").split(":"))
+                    content_type = f"application/x-{service}-advertisement"
+                elif self.command == "POST" and parts[2:] in (["git-receive-pack"], ["git-upload-pack"]):
+                    service = parts[2]
+                    if service == "git-receive-pack":
+                        result = git_receive_pack(repo, body)
+                        date = self.store.date()
+                        repo.metadata.update(updated_at=date, pushed_at=date)
                     else:
-                        raise APIError(404, "Not Found")
-                if self.command == "POST" and service == "git-receive-pack":
-                    self.store.save()
+                        result = git_upload_pack(repo, body, query)
+                    content_type = f"application/x-{service}-result"
+                else:
+                    raise APIError(404, "Not Found")
+            if self.command == "POST" and service == "git-receive-pack":
+                self.store.save()
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(result)))
@@ -1189,20 +1237,32 @@ class Handler(BaseHTTPRequestHandler):
                                  {'errors': [{'message': error.message}]} if graphql else
                                  rpc_error(None, -32700, error.message))
                     return
-                with self.store.lock:
-                    result = handle_graphql(self, payload) if graphql else handle_mcp(self, payload)
-                    self.store.save()
-                    notification = not graphql and isinstance(payload, dict) and payload.get('method') == 'notifications/initialized'
-                    self.respond(202 if notification else 200, result)
+                if graphql:
+                    with self.store.lock, ExitStack() as locks:
+                        for repo in self.store.repos.values():
+                            locks.enter_context(repo.lock)
+                        result = copy.deepcopy(handle_graphql(self, payload))
+                else:
+                    result = handle_mcp(self, payload)
+                self.store.save()
+                notification = not graphql and isinstance(payload, dict) and payload.get('method') == 'notifications/initialized'
+                self.respond(202 if notification else 200, result)
                 return
             payload = self.read_payload()
-            with self.store.lock:
-                status, result, headers = self.dispatch(parts, query, payload)
-                if self.command in ("POST", "PUT", "PATCH", "DELETE"):
-                    self.store.save()
-                self.respond(status, result, headers)
+            status, result, headers = self.dispatch(parts, query, payload)
+            if self.command in ("POST", "PUT", "PATCH", "DELETE"):
+                self.store.save()
+            self.respond(status, result, headers)
         except APIError as error:
             self.respond(error.status, {"message": error.message})
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError, RecursionError, OverflowError):
+            self.close_connection = True
+            self.respond(400, {"message": "Invalid request"})
+        except OSError:
+            self.close_connection = True
+        except Exception:
+            self.close_connection = True
+            self.respond(500, {"message": "Internal server error"})
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = request
 
@@ -1231,6 +1291,21 @@ class Handler(BaseHTTPRequestHandler):
         return 200, values[start:start + size], headers
 
     def dispatch(self, parts, query, payload):
+        # Only registry operations need the store lock for their full duration.
+        if parts[:3] == ['api', 'v3', 'repos'] and len(parts) >= 5:
+            with self.store.lock:
+                repo = self.store.repos.get(parts[4].lower()) if parts[3] == LOGIN else None
+                if repo is None:
+                    raise APIError(404, 'Not Found')
+                if len(parts) == 5 and self.command == 'DELETE':
+                    with repo.lock:
+                        return self.repository_route(repo, [], query, payload)
+            with repo.lock:
+                return copy.deepcopy(self.repository_route(repo, parts[5:], query, payload))
+        with self.store.lock:
+            return copy.deepcopy(self.registry_dispatch(parts, query, payload))
+
+    def registry_dispatch(self, parts, query, payload):
         method = self.command
         if parts[:2] != ["api", "v3"]:
             raise APIError(404, "Not Found")
@@ -1245,7 +1320,11 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"login": LOGIN, "id": 1, "type": "User"}, {}
         if route == ["user", "repos"]:
             if method == "GET":
-                return self.paginate([self.repo_json(repo) for repo in self.store.repos.values()], query)
+                values = []
+                for repo in self.store.repos.values():
+                    with repo.lock:
+                        values.append(self.repo_json(repo))
+                return self.paginate(values, query)
             if method == "POST":
                 name = required_text(payload, "name")
                 if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in (".", ".."):
@@ -1283,17 +1362,20 @@ class Handler(BaseHTTPRequestHandler):
                 return 201, self.create_pull(repo, payload), {}
             if method == 'GET':
                 state = query.get('state', ['open'])[0]
-                return self.paginate([i for i in repo.issues.values() if 'head' in i and
+                return self.paginate([self.pull_json(repo, i) for i in repo.issues.values() if 'head' in i and
                                       (state == 'all' or i['state'] == state)], query)
         if len(route) >= 2 and route[0] == 'pulls':
             issue = repo.issues.get(route[1])
             if not issue or 'head' not in issue:
                 raise APIError(404, 'Pull request not found')
             if len(route) == 2 and method == 'GET':
-                return 200, issue, {}
+                return 200, self.pull_json(repo, issue), {}
             if route[2:] == ['merge'] and method == 'PUT':
-                self.merge_pull(repo, issue)
-                return 200, {'merged': True, 'sha': issue['merge_commit_sha'], 'message': 'Pull request successfully merged'}, {}
+                message = payload.get('commit_message')
+                if message is not None and not isinstance(message, str):
+                    raise APIError(422, 'Invalid commit_message')
+                self.merge_pull(repo, issue, message)
+                return 200, {'merged': True, 'sha': issue['merge_commit_sha'], 'message': 'Pull Request successfully merged'}, {}
             if route[2:] == ['files'] and method == 'GET':
                 return self.paginate([{'filename': p, 'status': 'modified'} for p in self.pull_files(repo, issue)], query)
         if not route:
@@ -1386,7 +1468,7 @@ class Handler(BaseHTTPRequestHandler):
             owner, head = head.split(':', 1)
             if owner != LOGIN:
                 raise APIError(422, 'Unknown head repository')
-        if head == base or head not in repo.refs or base not in repo.refs:
+        if head == base or head.startswith('refs/') or base.startswith('refs/') or head not in repo.refs or base not in repo.refs:
             raise APIError(422, 'Head and base must be distinct existing branches')
         number, date = len(repo.issues) + 1, self.store.date()
         issue = {'id': self.store.identifier(), 'number': number, 'title': title, 'body': payload.get('body'),
@@ -1398,7 +1480,18 @@ class Handler(BaseHTTPRequestHandler):
         issue['node_id'] = gql_id('PullRequest', issue['id'])
         issue['pull_request'] = {'url': issue['url']}
         repo.issues[str(number)] = issue
-        return issue
+        return self.pull_json(repo, issue)
+
+    def pull_json(self, repo, issue):
+        result = copy.deepcopy(issue)
+        if not issue['merged']:
+            try:
+                _, _, head, base = self.pull_merge_snapshot(repo, issue)
+                result['head']['sha'], result['base']['sha'] = head, base
+                result['mergeable'] = True
+            except APIError:
+                result['mergeable'] = False
+        return result
 
     def pull_merge_snapshot(self, repo, issue):
         head = repo.resolve(issue['head']['ref'])
@@ -1425,20 +1518,24 @@ class Handler(BaseHTTPRequestHandler):
                 seen.add(sha)
                 _, parents = commit_headers(split_object(repo.objects[sha])[1])
                 queue.extend(parents)
-        previous = repo.commits[common]['files'] if common else {}
-        source, target = repo.commits[head]['files'], repo.commits[base]['files']
+        previous = repo.entries(common) if common else {}
+        source, target = repo.entries(head), repo.entries(base)
         files, changed = dict(target), []
         for path in sorted(previous.keys() | source.keys()):
             if source.get(path) == previous.get(path):
                 continue
             if target.get(path) not in (previous.get(path), source.get(path)):
-                raise APIError(405, 'Merge conflict in ' + path)
+                raise APIError(405, 'Pull Request is not mergeable')
             if source.get(path) != target.get(path):
                 changed.append(path)
             if path in source:
                 files[path] = source[path]
             else:
                 files.pop(path, None)
+        for path in files:
+            parts = path.split('/')
+            if any('/'.join(parts[:i]) in files for i in range(1, len(parts))):
+                raise APIError(405, 'Pull Request is not mergeable')
         return files, changed, head, base
 
     def pull_files(self, repo, issue):
@@ -1446,19 +1543,19 @@ class Handler(BaseHTTPRequestHandler):
         target = repo.commits[issue['base']['sha']]['files']
         return sorted(p for p in source.keys() | target.keys() if source.get(p) != target.get(p))
 
-    def merge_pull(self, repo, issue):
+    def merge_pull(self, repo, issue, message=None):
         if issue['merged']:
             return
         if issue['state'] != 'open':
             raise APIError(409, 'Pull request is closed')
-        files, changed, _, _ = self.pull_merge_snapshot(repo, issue)
+        entries, changed, head, base = self.pull_merge_snapshot(repo, issue)
+        files = {path: value[1] for path, value in entries.items() if value[0] != b'160000'}
         date = self.store.date()
         branch = issue['base']['ref']
-        sha = repo.commit(files, 'Merge pull request #' + str(issue['number']) + ': ' + issue['title'],
-                          branch, date, changed)
-        # repo.commit uses only the current base tip as parent: a squash merge.
+        sha = repo.commit(files, message if message is not None else 'Merge pull request #' + str(issue['number']),
+                          branch, date, changed, parents=[base, head], tree=repo.tree(entries))
         issue.update(merged=True, state='closed', merged_at=date, closed_at=date, updated_at=date,
-                     merge_commit_sha=sha)
+                     merge_commit_sha=sha, merged_commit=sha)
 
     def issue_json(self, repo, issue):
         result = dict(issue)
@@ -1470,7 +1567,7 @@ class Handler(BaseHTTPRequestHandler):
         person = {"name": LOGIN, "email": LOGIN + "@users.noreply.local", "date": commit["date"]}
         return {"sha": sha, "commit": {"message": commit["message"], "author": person,
                                       "committer": dict(person), "tree": {"sha": commit["tree"]}},
-                "parents": [{"sha": commit["parent"]}] if commit["parent"] else []}
+                "parents": [{"sha": parent} for parent in commit_headers(split_object(repo.objects[sha])[1])[1]]}
 
     def file_json(self, repo, path, sha, include_content=True):
         raw = repo.blob(sha)
@@ -1547,18 +1644,19 @@ class Handler(BaseHTTPRequestHandler):
 def poll_done(environment_url):
     url = environment_url.rstrip("/") + "/done"
     while True:
+        started = time.monotonic()
         try:
-            with urllib.request.urlopen(url, timeout=65) as response:
+            with urllib.request.urlopen(url, timeout=5) as response:
                 if json.load(response).get("done") is True:
                     os._exit(0)
-        except (OSError, ValueError, urllib.error.URLError):
+        except (OSError, ValueError, AttributeError, urllib.error.URLError):
             pass
-        threading.Event().wait(0.25)
+        threading.Event().wait(max(0, 5 - (time.monotonic() - started)))
 
 
 def main():
     store = Store(os.environ.get("MAKEFUN_STATE_DIR", ".local/forge"))
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = ForgeServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     server.store = store
     server.token = os.environ.get("MAKEFUN_SHOP_TOKEN", "tok")
