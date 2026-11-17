@@ -7,6 +7,7 @@ an empty string to disable persistence. Stored objects include their Git headers
 import base64
 import binascii
 import copy
+from collections import ChainMap
 from contextlib import ExitStack
 import datetime
 import hashlib
@@ -263,11 +264,13 @@ def commit_headers(content):
     return tree, parents
 
 
-def reachable(repo, starts, depth=None, shallow=()):
+def reachable(repo, starts, depth=None, shallow=(), validated=()):
     seen, boundaries, levels = set(), set(), {}
     queue = [(sha, 1) for sha in starts]
     while queue:
         sha, level = queue.pop()
+        if sha in validated:
+            continue
         if sha in levels and levels[sha] <= level:
             continue
         levels[sha] = level
@@ -387,14 +390,19 @@ def git_receive_pack(repo, body):
     objects = parse_pack(pack, repo.objects) if pack else {}
     # Keep validation and indexing transactional, including malformed trees/commits.
     view = Repository(repo.metadata)
-    view.objects = repo.objects | objects
+    view.objects = ChainMap(objects, repo.objects)
     view.commits = repo.commits
     indexed = index_commits(view, objects)
+    validated = set()
     for _, new, _ in commands:
         if new != ZERO:
-            reachable(view, [new])
+            seen, _ = reachable(view, [new], validated=repo.validated_objects)
+            validated.update(seen)
     repo.objects.update(objects)
     repo.commits.update(indexed)
+    # Git objects are immutable and never removed. A fully checked closure stays
+    # valid across ref changes; publish it only after all validation succeeds.
+    repo.validated_objects.update(validated)
     result = pktline("unpack ok\n")
     for old, new, ref in commands:
         key = ref.removeprefix("refs/heads/")
@@ -449,9 +457,19 @@ def git_upload_pack(repo, body, params):
     if command and not done:
         return pktline("acknowledgments\n") + (b"".join(pktline(f"ACK {sha}\n") for sha in common)
                                                  or pktline("NAK\n")) + b"0000"
-    wanted, boundaries = reachable(repo, wants, depth)
-    have_objects, _ = reachable(repo, common, shallow=shallow)
-    pack = write_pack(repo, wanted - have_objects)
+    # Bound the cache to one pack, and compare all refs so REST, MCP, merges,
+    # branch deletion, and receive-pack updates all invalidate it lazily.
+    cache_key = (tuple(sorted(repo.refs.items())), tuple(sorted(set(wants))))
+    cacheable = depth == 1 and not haves and not shallow
+    cached = repo.shallow_pack_cache if cacheable else None
+    if cached is not None and cached[0] == cache_key:
+        _, wanted, boundaries, pack = cached
+    else:
+        wanted, boundaries = reachable(repo, wants, depth)
+        have_objects, _ = reachable(repo, common, shallow=shallow)
+        pack = write_pack(repo, wanted - have_objects)
+        if cacheable:
+            repo.shallow_pack_cache = (cache_key, wanted, boundaries, pack)
     shallow_lines = b""
     if depth is not None:
         shallow_lines = b"".join(pktline(f"shallow {sha}\n") for sha in sorted(boundaries - shallow))
@@ -896,6 +914,8 @@ class Repository:
         self.lock = threading.RLock()
         self.metadata = metadata
         self.objects = {}
+        self.validated_objects = set()
+        self.shallow_pack_cache = None
         self.refs = {}
         self.commits = {}
         self.labels = {}
@@ -1052,6 +1072,7 @@ def required_text(payload, key):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
 
     def setup(self):
         super().setup()
@@ -1301,7 +1322,14 @@ class Handler(BaseHTTPRequestHandler):
                     with repo.lock:
                         return self.repository_route(repo, [], query, payload)
             with repo.lock:
-                return copy.deepcopy(self.repository_route(repo, parts[5:], query, payload))
+                response = self.repository_route(repo, parts[5:], query, payload)
+                if (self.command == 'GET' and len(parts) == 7 and parts[5] == 'issues'
+                        and 'head' not in response[1]):
+                    # issue_json already copied the mutable top-level fields.
+                    # Ordinary issue labels/user are never mutated in place;
+                    # serialize this snapshot after releasing the repo lock.
+                    return response
+                return copy.deepcopy(response)
         with self.store.lock:
             return copy.deepcopy(self.registry_dispatch(parts, query, payload))
 
