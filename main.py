@@ -607,7 +607,7 @@ GRAPHQL_FIELDS = {
 }
 
 
-def gql_object(typename, **values):
+def gql_object(typename, /, **values):
     return dict(values, __typename=typename)
 
 
@@ -1432,7 +1432,7 @@ class Handler(BaseHTTPRequestHandler):
             if source.get(path) == previous.get(path):
                 continue
             if target.get(path) not in (previous.get(path), source.get(path)):
-                raise APIError(409, 'Merge conflict in ' + path)
+                raise APIError(405, 'Merge conflict in ' + path)
             if source.get(path) != target.get(path):
                 changed.append(path)
             if path in source:
@@ -1451,20 +1451,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if issue['state'] != 'open':
             raise APIError(409, 'Pull request is closed')
-        files, changed, head, base = self.pull_merge_snapshot(repo, issue)
+        files, changed, _, _ = self.pull_merge_snapshot(repo, issue)
         date = self.store.date()
         branch = issue['base']['ref']
         sha = repo.commit(files, 'Merge pull request #' + str(issue['number']) + ': ' + issue['title'],
                           branch, date, changed)
-        # Preserve both parents so subsequent Git fetches see a real merge commit.
-        content = split_object(repo.objects[sha])[1]
-        content = content.replace(('parent ' + base + '\n').encode(),
-                                  ('parent ' + base + '\nparent ' + head + '\n').encode(), 1)
-        merged_sha = repo.object('commit', content)
-        repo.commits[merged_sha] = repo.commits[sha]
-        repo.refs[branch] = merged_sha
+        # repo.commit uses only the current base tip as parent: a squash merge.
         issue.update(merged=True, state='closed', merged_at=date, closed_at=date, updated_at=date,
-                     merge_commit_sha=merged_sha)
+                     merge_commit_sha=sha)
 
     def issue_json(self, repo, issue):
         result = dict(issue)
