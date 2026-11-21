@@ -73,7 +73,9 @@ The implementation is one file with logical modules:
 
 `ForgeServer` uses threads and a request backlog of 128. HTTP/1.1 keep-alive, explicit response lengths, and TCP_NODELAY reduce repeated-request latency; connections have a ten-second timeout. Ordinary repository work uses per-repository reentrant locks after releasing the registry lock, allowing work on different repositories to overlap. GraphQL takes the registry and all repository locks for execution. Persistence snapshots also lock all repositories, then write and atomically replace the state file.
 
-Push validation uses a quarantine mapping and remembers validated immutable object closures. Each repository caches one depth-1 pack for requests without haves or shallow boundaries; the cache key includes all refs and wanted IDs, so ref changes invalidate it lazily. Ordinary issue reads serialize a snapshot after releasing the repository lock.
+Push validation uses a quarantine mapping and remembers validated immutable object closures. Each repository caches one depth-1 pack for requests without haves or shallow boundaries. Upload negotiation also caches two framed responses, keyed by the request, refs, object count, and default branch. The v2 advertisement is precomputed. Ordinary issue reads reuse serialized bytes until an issue changes; issue creation prepares those bytes once for the response and subsequent reads.
+
+Keep-alive connections reuse bounded caches of parsed paths, response headers, and identical request headers previously validated by the standard HTTP parser. Changed or partial headers and requests using `Expect` go through the standard parser. JSON headers and bodies are sent together, and request IDs combine a process prefix with a shared counter. Set `MAKEFUN_ACCESS_LOG=1` to enable per-request access logging. Response caches are excluded from persisted snapshots.
 
 See [BENCHMARK.md](BENCHMARK.md) for measurements and reproduction instructions. The project is licensed under [MIT](LICENSE).
 

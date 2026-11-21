@@ -12,6 +12,7 @@ from contextlib import ExitStack
 import datetime
 import hashlib
 import hmac
+import itertools
 import json
 import os
 import re
@@ -52,6 +53,11 @@ def pktline(data):
     if len(data) > 65515:
         raise ValueError("pkt-line too large")
     return f"{len(data) + 4:04x}".encode() + data
+
+
+V2_ADVERTISEMENT = b"".join(pktline(line + "\n") for line in
+                            ("version 2", "ls-refs=unborn", "fetch=shallow wait-for-done filter",
+                             "object-format=sha1", "agent=forge/1.0")) + b"0000"
 
 
 def read_pkt(data, offset):
@@ -340,11 +346,9 @@ def full_refs(repo):
 
 
 def git_advertisement(repo, service, v2=False):
-    intro = pktline(f"# service={service}\n") + b"0000"
     if v2 and service == "git-upload-pack":
-        return b"".join(pktline(line + "\n") for line in
-                                ("version 2", "ls-refs=unborn", "fetch=shallow wait-for-done filter",
-                                 "object-format=sha1", "agent=forge/1.0")) + b"0000"
+        return V2_ADVERTISEMENT
+    intro = pktline(f"# service={service}\n") + b"0000"
     refs = full_refs(repo)
     head = "refs/heads/" + repo.metadata["default_branch"]
     if service == "git-upload-pack":
@@ -445,6 +449,20 @@ def git_receive_pack(repo, body):
 
 
 def git_upload_pack(repo, body, params):
+    # Keep at most one response for each negotiation phase. Git objects are
+    # immutable and append-only; refs, object count and HEAD cover its inputs.
+    slot = b"command=ls-refs" in body
+    key = (body, tuple(sorted(repo.refs.items())), len(repo.objects), repo.metadata["default_branch"])
+    cached = repo.upload_response_cache.get(slot)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    result = _git_upload_pack(repo, body, params)
+    if len(body) <= 8192 and len(result) <= 1024 * 1024:
+        repo.upload_response_cache[slot] = (key, result)
+    return result
+
+
+def _git_upload_pack(repo, body, params):
     lines = [line.decode() for line in packet_lines(body)]
     command = next((line[8:] for line in lines if line.startswith("command=")), None)
     if command == "ls-refs":
@@ -1000,10 +1018,12 @@ class Repository:
         self.objects = {}
         self.validated_objects = set()
         self.shallow_pack_cache = None
+        self.upload_response_cache = {}
         self.refs = {}
         self.commits = {}
         self.labels = {}
         self.issues = {}
+        self.issue_response_cache = {}
         self.comments = {}
 
     def object(self, kind, content):
@@ -1109,6 +1129,8 @@ class Store:
         self.repos = {}
         self.counter = 0
         self.next_id = 1
+        self.request_ids = itertools.count()
+        self.request_id_prefix = uuid.uuid4().hex[:16].encode()
         self.path = Path(state_dir) / "state.json" if state_dir else None
         if self.path and self.path.exists():
             data = json.loads(self.path.read_text())
@@ -1174,10 +1196,50 @@ def login_from_token(token):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     disable_nagle_algorithm = True
+    access_log = os.environ.get("MAKEFUN_ACCESS_LOG", "") == "1"
 
     def setup(self):
         super().setup()
         self.connection.settimeout(10)
+        self.authorization = ("Bearer " + self.server.token).encode()
+        self.response_prefix = ("HTTP/1.1 {status}\r\nServer: " + self.version_string() +
+                                "\r\nDate: " + self.date_time_string() + "\r\n").encode()
+        self.response_heads = {}
+        self.git_response_heads = {}
+        self.parsed_paths = {}
+        self.parsed_requests = {}
+
+    def parse_request(self):
+        # Repeated keep-alive requests commonly have identical header bytes.
+        # Reuse only a block already validated by the stdlib parser. Changed,
+        # partial, unusual or Expect-bearing requests still use that parser.
+        line = self.raw_requestline
+        header_block = None
+        if (line.endswith(b" HTTP/1.1\r\n") and len(line.split()) == 3 and
+                line.startswith((b"GET ", b"POST ", b"PUT ", b"PATCH ", b"DELETE ", b"HEAD ", b"OPTIONS "))):
+            buffered = self.rfile.peek()
+            end = buffered.find(b"\r\n\r\n")
+            if end >= 0:
+                header_block = buffered[:end + 4]
+                cached = self.parsed_requests.get((line, header_block))
+                if cached is not None:
+                    self.rfile.read(len(header_block))
+                    (self.headers, self.command, self.path, self.request_version,
+                     self.requestline, self.close_connection) = cached
+                    return True
+        valid = super().parse_request()
+        if (valid and header_block is not None and len(line) + len(header_block) <= 8192
+                and not self.headers.get("Expect")):
+            if len(self.parsed_requests) >= 8:
+                self.parsed_requests.clear()
+            self.parsed_requests[(line, header_block)] = (
+                self.headers, self.command, self.path, self.request_version,
+                self.requestline, self.close_connection)
+        return valid
+
+    def log_request(self, code='-', size='-'):
+        if self.access_log:
+            super().log_request(code, size)
 
     def handle_one_request(self):
         try:
@@ -1207,17 +1269,26 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.base_url + "/api/v3"
 
     def respond(self, status, payload=None, headers=None):
-        body = b"" if status in (202, 204) else json.dumps(
+        body = b"" if status in (202, 204) else payload if isinstance(payload, bytes) else json.dumps(
             payload, ensure_ascii=True, separators=(",", ":")).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-GitHub-Request-Id", uuid.uuid4().hex)
-        for key, value in (headers or {}).items():
-            self.send_header(key, value)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        self.log_request(status)
+        request_id = self.store.request_id_prefix + f"{next(self.store.request_ids):016x}".encode()
+        key = (status, len(body))
+        head = self.response_heads.get(key)
+        if head is None:
+            head = (self.response_prefix.replace(b"{status}",
+                    f"{status} {self.responses.get(status, ('',))[0]}".encode()) +
+                    b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode() +
+                    b"\r\nX-GitHub-Request-Id: ")
+            if len(self.response_heads) >= 16:
+                self.response_heads.clear()
+            self.response_heads[key] = head
+        head += request_id + b"\r\n"
+        if headers:
+            head += "".join(f"{key}: {value}\r\n" for key, value in headers.items()).encode('latin-1')
+            if headers.get("Connection", "").lower() == "close":
+                self.close_connection = True
+        self.wfile.write(head + b"\r\n" + (body if self.command != "HEAD" else b""))
 
     def handle_expect_100(self):
         if not self.authorized():
@@ -1228,7 +1299,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def authorized(self):
         return hmac.compare_digest(self.headers.get("Authorization", "").encode(),
-                                   ("Bearer " + self.server.token).encode())
+                                   self.authorization)
 
     @property
     def login(self):
@@ -1332,12 +1403,18 @@ class Handler(BaseHTTPRequestHandler):
                     raise APIError(404, "Not Found")
             if self.command == "POST" and service == "git-receive-pack":
                 self.store.save()
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(result)))
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(result)
+            self.log_request(200)
+            key = (content_type, len(result))
+            head = self.git_response_heads.get(key)
+            if head is None:
+                head = (self.response_prefix.replace(b"{status}", b"200 OK") +
+                        b"Content-Type: " + content_type.encode() +
+                        b"\r\nContent-Length: " + str(len(result)).encode() +
+                        b"\r\nCache-Control: no-cache\r\n\r\n")
+                if len(self.git_response_heads) >= 8:
+                    self.git_response_heads.clear()
+                self.git_response_heads[key] = head
+            self.wfile.write(head + result)
         except (ValueError, IndexError, KeyError, StopIteration, OverflowError, zlib.error, struct.error) as error:
             self.close_connection = True
             raise APIError(400, "Invalid Git request: " + str(error))
@@ -1351,9 +1428,16 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(401, {"message": "Requires authentication"}, {"Connection": "close"})
             return
         try:
-            parsed = urllib.parse.urlsplit(self.path)
-            parts = [urllib.parse.unquote(p) for p in parsed.path.rstrip("/").split("/")[1:]]
-            query = urllib.parse.parse_qs(parsed.query)
+            cached_path = self.parsed_paths.get(self.path)
+            if cached_path is not None:
+                parts, query = cached_path
+            else:
+                parsed = urllib.parse.urlsplit(self.path)
+                parts = [urllib.parse.unquote(p) for p in parsed.path.rstrip("/").split("/")[1:]]
+                query = urllib.parse.parse_qs(parsed.query)
+                if len(self.parsed_paths) >= 8:
+                    self.parsed_paths.clear()
+                self.parsed_paths[self.path] = (parts, query)
             if len(parts) >= 3 and parts[1].endswith(".git"):
                 self.git_request(parts, query)
                 return
@@ -1378,7 +1462,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(202 if notification else 200, result)
                 return
             payload = self.read_payload()
-            status, result, headers = self.dispatch(parts, query, payload)
+            status, result, headers = self.dispatch(parts, query, payload, serialize=True)
             if self.command in ("POST", "PUT", "PATCH", "DELETE"):
                 self.store.save()
             self.respond(status, result, headers)
@@ -1419,7 +1503,7 @@ class Handler(BaseHTTPRequestHandler):
             headers["Link"] = '<' + url + '>; rel="next"'
         return 200, values[start:start + size], headers
 
-    def dispatch(self, parts, query, payload):
+    def dispatch(self, parts, query, payload, serialize=False):
         # Only registry operations need the store lock for their full duration.
         if parts[:3] == ['api', 'v3', 'repos'] and len(parts) >= 5:
             with self.store.lock:
@@ -1430,16 +1514,29 @@ class Handler(BaseHTTPRequestHandler):
                     with repo.lock:
                         return self.repository_route(repo, [], query, payload)
             with repo.lock:
+                if serialize and self.command == 'GET' and len(parts) == 7 and parts[5] == 'issues':
+                    issue = repo.issues.get(parts[6])
+                    if issue is not None and 'head' not in issue:
+                        return 200, self.issue_response(repo, issue), {}
                 response = self.repository_route(repo, parts[5:], query, payload)
-                if (self.command == 'GET' and len(parts) == 7 and parts[5] == 'issues'
-                        and 'head' not in response[1]):
-                    # issue_json already copied the mutable top-level fields.
-                    # Ordinary issue labels/user are never mutated in place;
-                    # serialize this snapshot after releasing the repo lock.
-                    return response
+                if serialize and self.command == 'POST' and len(parts) == 6 and parts[5] == 'issues':
+                    # Creation already returns a complete, isolated issue. Reuse
+                    # its serialized form for both this response and later reads.
+                    return response[0], self.issue_response(repo, response[1]), response[2]
                 return copy.deepcopy(response)
         with self.store.lock:
             return copy.deepcopy(self.registry_dispatch(parts, query, payload))
+
+    def issue_response(self, repo, issue):
+        number = str(issue['number'])
+        cached = repo.issue_response_cache.get(number)
+        # Ordinary issue labels/user are immutable snapshots; every
+        # issue mutation changes a top-level value, including comments.
+        if cached is None or cached[0] != issue:
+            body = json.dumps(self.issue_json(repo, issue), ensure_ascii=True, separators=(",", ":")).encode()
+            cached = (dict(issue), body)
+            repo.issue_response_cache[number] = cached
+        return cached[1]
 
     def registry_dispatch(self, parts, query, payload):
         method = self.command

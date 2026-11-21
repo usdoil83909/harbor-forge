@@ -1,5 +1,50 @@
 # Forge performance measurements
 
+## Full conformance runner optimization
+
+The full runner uses its own HTTP Git client and REST client, with five warm-up
+operations followed by three timed rounds per workload. These measurements are
+distinct from the real-Git subprocess benchmark below. Run:
+
+```sh
+bash /root/makefun/forge_fullrun.sh
+python3 /root/makefun/parse_suite.py
+```
+
+Every measured optimization stage passed all 120 conformance checks, with zero
+failed checks and no failed performance workloads. Times below are p50 milliseconds.
+
+| Stage | Push | Clone | Read | Write | Performance points |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Supplied baseline | 372.850 | 155.020 | 1079.890 | 153.830 | 167 |
+| Serialized issue cache and combined JSON response writes | 365.329 | 122.493 | 941.549 | 152.736 | 173 |
+| Framed upload cache, static v2 advertisement, creation serialization | 413.326 | 122.045 | 1083.392 | 146.465 | 172 |
+| Cached paths/response headers, opt-in access logs | 344.794 | 128.069 | 802.417 | 132.627 | 177 |
+| Reuse identical validated request headers | 343.676 | 110.157 | 566.436 | 135.957 | 183 |
+| Bounded caches covering multiple negotiation requests | 317.548 | 104.406 | 556.304 | 132.401 | 184 |
+| Larger header-cache experiment | 319.233 | 105.718 | 608.953 | 133.710 | 184 |
+| Final verification after restoring smaller caches | 325.965 | 110.657 | 584.285 | 136.860 | 183 |
+
+The larger header-cache experiment did not improve performance and was reverted.
+The final run earns 50 push, 41 clone, 50 read, and 42 write points, for a total
+score of 983 (600 feature + 200 agent + 183 performance). Read earns the maximum
+50 points. Read, clone, and write remain above the requested latency targets;
+results vary between runs on this host.
+
+`python3 -m unittest -v test_performance` checks cache invalidation after REST,
+GraphQL, and comment mutations; MCP issue creation; authentication and duplicate
+Content-Length handling; unique request IDs; Git HEAD/object/ref invalidation;
+and persistence across restart. Two independent operation replays produce
+byte-identical persisted state, including counters, IDs, issues, and metadata.
+
+The older standalone `python3 test_protocols.py` stops on its expectation of the
+unsupported GraphQL `Issue.createdAt` field. The same failure reproduces with
+the unmodified HEAD version of `main.py`; the full 120-check suite passes.
+
+## Earlier real-client benchmark
+
+The measurements and validation notes below predate the response-cache changes.
+
 Run `python3 benchmark.py --rounds 3` from this directory. Use
 `python3 benchmark.py --rounds 1 --profile` for separate diagnostic profiling;
 profiling serializes instrumentation and its timings are not comparable.
