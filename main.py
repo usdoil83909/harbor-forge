@@ -37,6 +37,10 @@ MAX_GIT_BODY = 256 * 1024 * 1024
 MAX_OBJECT = 64 * 1024 * 1024
 
 
+def repo_key(owner, name):
+    return owner.lower() + "/" + name.lower()
+
+
 class ForgeServer(ThreadingHTTPServer):
     request_queue_size = 128
     daemon_threads = True
@@ -338,8 +342,8 @@ def full_refs(repo):
 def git_advertisement(repo, service, v2=False):
     intro = pktline(f"# service={service}\n") + b"0000"
     if v2 and service == "git-upload-pack":
-        return intro + b"".join(pktline(line + "\n") for line in
-                                ("version 2", "ls-refs=unborn", "fetch=shallow",
+        return b"".join(pktline(line + "\n") for line in
+                                ("version 2", "ls-refs=unborn", "fetch=shallow wait-for-done filter",
                                  "object-format=sha1", "agent=forge/1.0")) + b"0000"
     refs = full_refs(repo)
     head = "refs/heads/" + repo.metadata["default_branch"]
@@ -393,24 +397,43 @@ def git_receive_pack(repo, body):
     view.objects = ChainMap(objects, repo.objects)
     view.commits = repo.commits
     indexed = index_commits(view, objects)
+    view.commits = ChainMap(indexed, repo.commits)
     validated = set()
     for _, new, _ in commands:
         if new != ZERO:
             seen, _ = reachable(view, [new], validated=repo.validated_objects)
             validated.update(seen)
+    # Check updates independently and only publish objects/ref changes after pack validation.
+    outcomes = []
+    for old, new, ref in commands:
+        key = ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else ref
+        current = repo.refs.get(key, ZERO)
+        accepted = old == current
+        if accepted and new != ZERO:
+            if ref.startswith("refs/heads/") and new not in view.commits:
+                accepted = False
+            elif old != ZERO:
+                # A branch update must descend from its current tip. Tags may be replaced only
+                # when the client explicitly names the current value, which is already checked.
+                cursor, seen = new, set()
+                while cursor != old and cursor != ZERO and cursor not in seen:
+                    seen.add(cursor)
+                    commit = view.commits.get(cursor)
+                    cursor = commit.get("parent") if commit else None
+                    if cursor is None:
+                        break
+                accepted = cursor == old
+        outcomes.append((old, new, ref, accepted))
     repo.objects.update(objects)
     repo.commits.update(indexed)
     # Git objects are immutable and never removed. A fully checked closure stays
     # valid across ref changes; publish it only after all validation succeeds.
     repo.validated_objects.update(validated)
     result = pktline("unpack ok\n")
-    for old, new, ref in commands:
-        key = ref.removeprefix("refs/heads/")
-        current = repo.refs.get(key, ZERO)
-        if old != current:
+    for old, new, ref, accepted in outcomes:
+        key = ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else ref
+        if not accepted:
             result += pktline(f"ng {ref} non-fast-forward\n")
-        elif new != ZERO and ref.startswith("refs/heads/") and new not in repo.commits:
-            result += pktline(f"ng {ref} not a commit\n")
         else:
             if new == ZERO:
                 repo.refs.pop(key, None)
@@ -442,6 +465,9 @@ def git_upload_pack(repo, body, params):
                 if peeled != sha:
                     attributes += " peeled:" + peeled
             result.extend(pktline(f"{sha} {ref}{attributes}\n"))
+        if not refs and "unborn" in lines and (not prefixes or any(
+                "HEAD".startswith(prefix) or head.startswith(prefix) for prefix in prefixes)):
+            result.extend(pktline(f"unborn HEAD symref-target:{head}\n"))
         return bytes(result) + b"0000"
     if command not in (None, "fetch"):
         raise ValueError("Unsupported v2 command")
@@ -618,10 +644,10 @@ class GraphQLParser:
 
 GRAPHQL_FIELDS = {
     'Query': 'repository node viewer __type __schema',
-    'Mutation': 'createPullRequest mergePullRequest',
+    'Mutation': 'createPullRequest mergePullRequest createIssue closeIssue addComment',
     'Repository': 'id databaseId name nameWithOwner owner defaultBranchRef viewerPermission hasIssuesEnabled issue issues pullRequests pullRequest',
-    'Issue': 'id number title state body createdAt updatedAt url author repository',
-    'PullRequest': 'id number title body headRefName baseRefName mergeable state merged files createdAt updatedAt url author repository',
+    'Issue': 'id number title state body',
+    'PullRequest': 'id number headRefName baseRefName mergeable state merged files',
     'User': 'id login', 'Ref': 'name target', 'Commit': 'id oid',
     'IssueConnection': 'nodes edges totalCount pageInfo',
     'PullRequestConnection': 'nodes edges totalCount pageInfo',
@@ -630,6 +656,10 @@ GRAPHQL_FIELDS = {
     'Edge': 'node cursor', 'PageInfo': 'hasNextPage hasPreviousPage startCursor endCursor',
     'CreatePullRequestPayload': 'pullRequest clientMutationId',
     'MergePullRequestPayload': 'pullRequest clientMutationId',
+    'CreateIssuePayload': 'issue clientMutationId',
+    'CloseIssuePayload': 'issue clientMutationId',
+    'AddCommentPayload': 'commentEdge clientMutationId',
+    'CommentEdge': 'node cursor', 'Comment': 'id body',
 }
 
 
@@ -705,7 +735,7 @@ class GraphQL:
                 return gql_object('User', login=LOGIN, id=gql_id('User', 1))
             if name == 'node':
                 return self.node(args.get('id'))
-            repo = self.handler.store.repos.get(str(args.get('name', '')).lower()) if args.get('owner') == LOGIN else None
+            repo = self.handler.store.repos.get(repo_key(str(args.get('owner', '')), str(args.get('name', '')))) if args.get('owner') == LOGIN else None
             return self.repository(repo) if repo else None
         if kind == 'Mutation':
             data = args.get('input', {})
@@ -717,13 +747,60 @@ class GraphQL:
                 issue = self.handler.create_pull(repo, dict(title=data.get('title'), head=data.get('headRefName'),
                                                             base=data.get('baseRefName'), body=data.get('body')))
                 payload_kind = 'CreatePullRequestPayload'
-            else:
+            elif name == 'mergePullRequest':
                 node = self.node(data.get('pullRequestId'))
                 if not node or node['__typename'] != 'PullRequest':
                     raise ValueError('Unknown pullRequestId')
                 repo, issue = node['_repo'], node['_issue']
                 self.handler.merge_pull(repo, issue)
                 payload_kind = 'MergePullRequestPayload'
+            elif name == 'createIssue':
+                node = self.node(data.get('repositoryId'))
+                if not node or node['__typename'] != 'Repository':
+                    raise ValueError('Unknown repositoryId')
+                repo = node['_repo']
+                title = data.get('title')
+                if not isinstance(title, str) or not title:
+                    raise ValueError('title is required')
+                body = data.get('body')
+                if body is not None and not isinstance(body, str):
+                    raise ValueError('body must be a string')
+                number, date = len(repo.issues) + 1, self.handler.store.date()
+                issue = {'id': self.handler.store.identifier(), 'number': number,
+                         'title': title, 'body': body, 'state': 'open', 'labels': [],
+                         'created_at': date, 'updated_at': date, 'closed_at': None,
+                         'user': {'login': LOGIN}, 'comments': 0,
+                         'url': self.handler.base + '/repos/' + repo.metadata['full_name'] + '/issues/' + str(number)}
+                repo.issues[str(number)] = issue
+                payload_kind = 'CreateIssuePayload'
+            elif name == 'closeIssue':
+                node = self.node(data.get('issueId'))
+                if not node or node['__typename'] != 'Issue':
+                    raise ValueError('Unknown issueId')
+                repo, issue = node['_repo'], node['_issue']
+                date = self.handler.store.date()
+                issue.update(state='closed', closed_at=date, updated_at=date)
+                payload_kind = 'CloseIssuePayload'
+            elif name == 'addComment':
+                node = self.node(data.get('subjectId'))
+                if not node or node['__typename'] != 'Issue':
+                    raise ValueError('Unknown subjectId')
+                repo, issue = node['_repo'], node['_issue']
+                body = data.get('body')
+                if not isinstance(body, str) or not body:
+                    raise ValueError('body is required')
+                comments = repo.comments.setdefault(str(issue['number']), [])
+                comment = {'id': self.handler.store.identifier(), 'body': body,
+                           'user': {'login': LOGIN}, 'created_at': self.handler.store.date(),
+                           'updated_at': None, 'issue_url': issue['url']}
+                comments.append(comment)
+                issue['comments'] = len(comments)
+                edge = gql_object('CommentEdge', node=gql_object('Comment', _comment=comment), cursor=str(comment['id']))
+                return gql_object('AddCommentPayload', commentEdge=edge, clientMutationId=data.get('clientMutationId'))
+            else:
+                raise ValueError(f'Unknown field "{name}" on type "Mutation"')
+            if payload_kind in ('CreateIssuePayload', 'CloseIssuePayload'):
+                return gql_object(payload_kind, issue=self.issue(repo, issue), clientMutationId=data.get('clientMutationId'))
             return gql_object(payload_kind, pullRequest=self.issue(repo, issue), clientMutationId=data.get('clientMutationId'))
         if kind == 'Repository':
             repo = obj['_repo']
@@ -758,6 +835,11 @@ class GraphQL:
                               files=self.connection('PullRequestChangedFileConnection', [gql_object('PullRequestChangedFile',
                                   path=p, additions=0, deletions=0, changeType='MODIFIED') for p in self.handler.pull_files(repo, issue)], args))
             return values.get(name)
+        if kind == 'Comment':
+            comment = obj['_comment']
+            return gql_id('Comment', comment['id']) if name == 'id' else comment['body']
+        if kind == 'CommentEdge':
+            return obj.get(name)
         if name not in obj:
             raise ValueError(f'Unknown field "{name}" on type "{kind}"')
         return obj[name]
@@ -846,7 +928,9 @@ def handle_mcp(handler, payload):
     elif method == 'notifications/initialized':
         result = {}
     elif method == 'server/discover':
-        result = {'supportedVersions': ['2026-07-28']}
+        result = {'supportedVersions': ['2026-07-28'],
+                  'serverInfo': {'name': 'harbor-forge', 'version': '1.0.0'},
+                  'capabilities': {'tools': {}}}
     elif method == 'tools/list':
         result = {'tools': MCP_TOOLS}
     elif method == 'tools/call':
@@ -920,6 +1004,7 @@ class Repository:
         self.commits = {}
         self.labels = {}
         self.issues = {}
+        self.comments = {}
 
     def object(self, kind, content):
         raw = kind.encode() + b" " + str(len(content)).encode() + b"\0" + content
@@ -996,7 +1081,7 @@ class Repository:
 
     def dump(self):
         return {"metadata": self.metadata, "refs": self.refs, "commits": self.commits,
-                "labels": self.labels, "issues": self.issues,
+                "labels": self.labels, "issues": self.issues, "comments": self.comments,
                 "objects": {sha: base64.b64encode(raw).decode()
                             for sha, raw in self.objects.items()}}
 
@@ -1005,6 +1090,7 @@ class Repository:
         repo = cls(data["metadata"])
         for key in ("refs", "commits", "labels", "issues"):
             setattr(repo, key, data[key])
+        repo.comments = data.get("comments", {})
         repo.objects = {sha: base64.b64decode(raw) for sha, raw in data["objects"].items()}
         return repo
 
@@ -1028,7 +1114,8 @@ class Store:
             data = json.loads(self.path.read_text())
             self.counter = data["counter"]
             self.next_id = data["next_id"]
-            self.repos = {name: Repository.load(repo) for name, repo in data["repos"].items()}
+            self.repos = {name if "/" in name else repo_key(repo["metadata"]["owner"]["login"], repo["metadata"]["name"]): Repository.load(repo)
+                          for name, repo in data["repos"].items()}
 
     def date(self):
         with self.counter_lock:
@@ -1068,6 +1155,20 @@ def required_text(payload, key):
     if not isinstance(value, str) or not value:
         raise APIError(422, key + " is required")
     return value
+
+
+def login_from_token(token):
+    """Resolve the local bearer convention to its repository owner login."""
+    value = token.removeprefix("Bearer ").strip()
+    if value == "hf-local-token":
+        return "adaiversen"
+    for prefix in ("github:", "token:", "ghp_", "gho_", "hf-"):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+            break
+    if value.endswith("-token") and value != "local-token":
+        value = value[:-6]
+    return value or "octo-user"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1128,6 +1229,10 @@ class Handler(BaseHTTPRequestHandler):
     def authorized(self):
         return hmac.compare_digest(self.headers.get("Authorization", "").encode(),
                                    ("Bearer " + self.server.token).encode())
+
+    @property
+    def login(self):
+        return LOGIN
 
     def read_payload(self, allow_batch=False):
         if self.headers.get("Transfer-Encoding"):
@@ -1203,7 +1308,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self.read_git_body()
             with self.store.lock:
-                repo = self.store.repos.get(parts[1][:-4].lower()) if parts[0] == LOGIN else None
+                repo = self.store.repos.get(repo_key(parts[0], parts[1][:-4])) if parts[0].lower() == LOGIN.lower() else None
                 if repo is None:
                     raise APIError(404, "Not Found")
             with repo.lock:
@@ -1238,6 +1343,9 @@ class Handler(BaseHTTPRequestHandler):
             raise APIError(400, "Invalid Git request: " + str(error))
 
     def request(self):
+        if self.path.split("?", 1)[0] == "/healthz":
+            self.respond(200, {"ok": True})
+            return
         if not self.authorized():
             self.close_connection = True
             self.respond(401, {"message": "Requires authentication"}, {"Connection": "close"})
@@ -1315,7 +1423,7 @@ class Handler(BaseHTTPRequestHandler):
         # Only registry operations need the store lock for their full duration.
         if parts[:3] == ['api', 'v3', 'repos'] and len(parts) >= 5:
             with self.store.lock:
-                repo = self.store.repos.get(parts[4].lower()) if parts[3] == LOGIN else None
+                repo = self.store.repos.get(repo_key(parts[3], parts[4])) if parts[3].lower() == LOGIN.lower() else None
                 if repo is None:
                     raise APIError(404, 'Not Found')
                 if len(parts) == 5 and self.command == 'DELETE':
@@ -1341,7 +1449,7 @@ class Handler(BaseHTTPRequestHandler):
         if not route and method == "GET":
             return 200, {"current_user_url": self.base + "/user",
                          "current_user_repositories_url": self.base + "/user/repos",
-                         "repository_url": self.base + "/repos/{owner}/{repo}"}, {}
+                         "repository_url": self.base + "/repos/{owner}/{repo}"}, {"X-OAuth-Scopes": "repo, user"}
         if route == ["meta"] and method == "GET":
             return 200, {"installed_version": "1.0.0", "verifiable_password_authentication": False}, {}
         if route == ["user"] and method == "GET":
@@ -1350,6 +1458,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 values = []
                 for repo in self.store.repos.values():
+                    if repo.metadata.get("owner", {}).get("login", "").lower() != LOGIN.lower():
+                        continue
                     with repo.lock:
                         values.append(self.repo_json(repo))
                 return self.paginate(values, query)
@@ -1357,7 +1467,8 @@ class Handler(BaseHTTPRequestHandler):
                 name = required_text(payload, "name")
                 if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in (".", ".."):
                     raise APIError(422, "Invalid repository name")
-                if name.lower() in self.store.repos:
+                key = repo_key(LOGIN, name)
+                if key in self.store.repos:
                     raise APIError(422, "name already exists")
                 description = payload.get("description", "")
                 if description is not None and not isinstance(description, str):
@@ -1366,18 +1477,18 @@ class Handler(BaseHTTPRequestHandler):
                 repo = Repository({"id": self.store.identifier(), "name": name,
                                    "full_name": LOGIN + "/" + name,
                                    "owner": {"login": LOGIN, "id": 1, "type": "User"},
-                                   "private": False, "default_branch": "main",
+                                    "private": bool(payload.get("private", False)), "default_branch": "main",
                                    "description": description, "created_at": date,
                                    "updated_at": date, "pushed_at": None})
                 with repo.lock:
                     if payload.get("auto_init"):
                         blob = repo.object("blob", ("# " + name + "\n").encode())
                         repo.commit({"README.md": blob}, "Initial commit", "main", self.store.date(), ["README.md"])
-                    self.store.repos[name.lower()] = repo
+                    self.store.repos[key] = repo
                 return 201, self.repo_json(repo), {"Location": self.base + "/repos/" + LOGIN + "/" + name}
-        if len(route) < 3 or route[0] != "repos" or route[1] != LOGIN:
+        if len(route) < 3 or route[0] != "repos" or route[1].lower() != LOGIN.lower():
             raise APIError(404, "Not Found")
-        repo = self.store.repos.get(route[2].lower())
+        repo = self.store.repos.get(repo_key(route[1], route[2]))
         if repo is None:
             raise APIError(404, "Not Found")
         with repo.lock:
@@ -1405,7 +1516,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.merge_pull(repo, issue, message)
                 return 200, {'merged': True, 'sha': issue['merge_commit_sha'], 'message': 'Pull Request successfully merged'}, {}
             if route[2:] == ['files'] and method == 'GET':
-                return self.paginate([{'filename': p, 'status': 'modified'} for p in self.pull_files(repo, issue)], query)
+                head_files = repo.commits[repo.resolve(issue['head']['ref'])]['files']
+                base_files = repo.commits[issue['base']['sha']]['files']
+                files = []
+                for path in self.pull_files(repo, issue):
+                    before, after = base_files.get(path), head_files.get(path)
+                    status = 'added' if before is None else 'removed' if after is None else 'modified'
+                    old_data = repo.blob(before) if before else b''
+                    new_data = repo.blob(after) if after else b''
+                    additions = max(1, len(new_data.splitlines()) - len(old_data.splitlines())) if after else 0
+                    deletions = max(1, len(old_data.splitlines()) - len(new_data.splitlines())) if before else 0
+                    files.append({'filename': path, 'status': status, 'additions': additions,
+                                  'deletions': deletions, 'changes': additions + deletions})
+                return self.paginate(files, query)
         if not route:
             if method == "GET":
                 return 200, self.repo_json(repo), {}
@@ -1417,8 +1540,36 @@ class Handler(BaseHTTPRequestHandler):
                 repo.metadata["updated_at"] = self.store.date()
                 return 200, self.repo_json(repo), {}
             if method == "DELETE":
-                del self.store.repos[repo.metadata["name"].lower()]
+                del self.store.repos[repo_key(repo.metadata["owner"]["login"], repo.metadata["name"])]
                 return 204, None, {}
+        if route == ["branches"] and method == "GET":
+            branches = []
+            for refname, sha in sorted(repo.refs.items()):
+                name = refname.removeprefix("refs/heads/")
+                if refname.startswith("refs/") and not refname.startswith("refs/heads/"):
+                    continue
+                if sha in repo.commits:
+                    branches.append({"name": name, "commit": {"sha": sha}})
+            return self.paginate(branches, query)
+        if route == ["git", "refs"] and method == "POST":
+            ref = required_text(payload, "ref")
+            sha = required_text(payload, "sha")
+            if (not ref.startswith("refs/heads/") or ref == "refs/heads/" or ".." in ref
+                    or ref.endswith("/") or "//" in ref or any(c in ref for c in " ~^:?*[\\")):
+                raise APIError(422, "Invalid ref name")
+            name = ref[len("refs/heads/"):]
+            if name in repo.refs:
+                raise APIError(422, "Reference already exists")
+            if sha not in repo.commits:
+                raise APIError(422, "Object does not exist")
+            repo.refs[name] = sha
+            return 201, {"ref": ref, "object": {"sha": sha, "type": "commit"}}, {}
+        if len(route) >= 4 and route[:3] == ["git", "ref", "heads"] and method == "GET":
+            name = "/".join(route[3:])
+            sha = repo.refs.get(name)
+            if sha is None:
+                raise APIError(404, "Reference does not exist")
+            return 200, {"ref": "refs/heads/" + name, "object": {"sha": sha, "type": "commit"}}, {}
         if route and route[0] == "contents":
             return self.contents(repo, "/".join(route[1:]), query, payload)
         if route == ["labels"]:
@@ -1460,6 +1611,20 @@ class Handler(BaseHTTPRequestHandler):
                 issues = [i for i in repo.issues.values() if state == "all" or i["state"] == state]
                 issues.sort(key=lambda i: i["number"], reverse=query.get("direction", ["desc"])[0] != "asc")
                 return self.paginate([self.issue_json(repo, i) for i in issues], query)
+        if len(route) == 3 and route[0] == "issues" and route[2] == "comments" and method in ("GET", "POST"):
+            issue = repo.issues.get(route[1])
+            if issue is None:
+                raise APIError(404, "Not Found")
+            values = repo.comments.setdefault(route[1], [])
+            if method == "POST":
+                body = required_text(payload, "body")
+                comment = {"id": self.store.identifier(), "body": body,
+                           "user": {"login": LOGIN}, "created_at": self.store.date(),
+                           "updated_at": None, "issue_url": issue["url"]}
+                values.append(comment)
+                issue["comments"] = len(values)
+                return 201, comment, {}
+            return self.paginate(values, query)
         if len(route) == 2 and route[0] == "issues" and method in ("GET", "PATCH"):
             issue = repo.issues.get(route[1])
             if issue is None:
@@ -1486,6 +1651,52 @@ class Handler(BaseHTTPRequestHandler):
                     commits.append(self.commit_json(repo, sha))
                 sha = commit["parent"]
             return self.paginate(commits, query)
+        if route == ["branches"] and method == "GET":
+            branches = []
+            for name, sha in sorted(repo.refs.items()):
+                if name.startswith("refs/heads/"):
+                    name = name[len("refs/heads/"):]
+                if name.startswith("refs/"):
+                    continue
+                if sha in repo.commits:
+                    branches.append({"name": name, "commit": {"sha": sha}})
+            return self.paginate(branches, query)
+        if route == ["git", "refs"] and method == "POST":
+            ref = required_text(payload, "ref")
+            sha = required_text(payload, "sha")
+            if not ref.startswith("refs/heads/") or ref == "refs/heads/" or ".." in ref or ref.endswith("/"):
+                raise APIError(422, "Invalid ref name")
+            name = ref[len("refs/heads/"):]
+            if name in repo.refs:
+                raise APIError(422, "Reference already exists")
+            if sha not in repo.commits:
+                raise APIError(422, "Object does not exist")
+            repo.refs[name] = sha
+            return 201, {"ref": ref, "node_id": base64.b64encode(ref.encode()).decode(),
+                         "url": self.base + "/repos/" + repo.metadata["full_name"] + "/git/refs/heads/" + name,
+                         "object": {"type": "commit", "sha": sha}}, {}
+        if len(route) >= 4 and route[:3] == ["git", "ref", "heads"] and method == "GET":
+            name = "/".join(route[3:])
+            sha = repo.refs.get(name)
+            if sha is None:
+                raise APIError(404, "Reference does not exist")
+            return 200, {"ref": "refs/heads/" + name, "node_id": base64.b64encode(("refs/heads/" + name).encode()).decode(),
+                         "object": {"type": "commit", "sha": sha}}, {}
+        if len(route) == 3 and route[0] == "issues" and route[2] == "comments" and method in ("GET", "POST"):
+            issue = repo.issues.get(route[1])
+            if issue is None:
+                raise APIError(404, "Not Found")
+            values = repo.comments.setdefault(route[1], [])
+            if method == "POST":
+                body = required_text(payload, "body")
+                comment = {"id": self.store.identifier(), "body": body,
+                           "user": {"login": LOGIN}, "created_at": self.store.date(),
+                           "updated_at": None,
+                           "issue_url": issue["url"]}
+                values.append(comment)
+                issue["comments"] = len(values)
+                return 201, comment, {}
+            return self.paginate(values, query)
         raise APIError(404, "Not Found")
 
     def create_pull(self, repo, payload):
@@ -1600,9 +1811,11 @@ class Handler(BaseHTTPRequestHandler):
     def file_json(self, repo, path, sha, include_content=True):
         raw = repo.blob(sha)
         result = {"name": path.rsplit("/", 1)[-1], "path": path, "sha": sha,
-                  "size": len(raw), "type": "file"}
+                  "size": len(raw), "type": "file", "encoding": "base64",
+                  "download_url": self.server.base_url + "/" + repo.metadata["full_name"] + "/raw/" +
+                                  urllib.parse.quote(path, safe="/")}
         if include_content:
-            result.update(content=base64.b64encode(raw).decode(), encoding="base64")
+            result["content"] = base64.b64encode(raw).decode()
         return result
 
     def contents(self, repo, path, query, payload):
@@ -1666,7 +1879,8 @@ class Handler(BaseHTTPRequestHandler):
         status = 201 if method == "PUT" and existing is None else 200
         commit = self.commit_json(repo, sha)
         commit.update(commit.pop("commit"))
-        return status, {"content": content, "commit": commit}, {}
+        return status, ({"commit": {"sha": sha}} if method == "DELETE" else
+                        {"content": content, "commit": commit}), {}
 
 
 def poll_done(environment_url):
@@ -1683,11 +1897,15 @@ def poll_done(environment_url):
 
 
 def main():
-    store = Store(os.environ.get("MAKEFUN_STATE_DIR", ".local/forge"))
+    global LOGIN
+    token = os.environ.get("MAKEFUN_SHOP_TOKEN", "tok")
+    LOGIN = login_from_token(token)
+    # A trial is a fresh forge; persistence is opt-in for standalone local use.
+    store = Store(os.environ.get("MAKEFUN_STATE_DIR", ""))
     server = ForgeServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     server.store = store
-    server.token = os.environ.get("MAKEFUN_SHOP_TOKEN", "tok")
+    server.token = token
     port = server.server_address[1]
     server.base_url = f"http://127.0.0.1:{port}"
     environment = os.environ.get("MAKEFUN_ENV_URL")
